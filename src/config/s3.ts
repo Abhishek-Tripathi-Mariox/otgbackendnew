@@ -1,8 +1,9 @@
 import { S3Client, DeleteObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import multer from "multer";
 import multerS3 from "multer-s3";
-import { v4 as uuidv4 } from "uuid";
+import { randomUUID } from "crypto";
 import path from "path";
+const uuidv4 = randomUUID;
 
 // Initialize S3 Client
 const s3Client = new S3Client({
