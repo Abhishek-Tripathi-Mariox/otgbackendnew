@@ -13,8 +13,10 @@ import {
   getVendorQuotation,
   deleteQuotation,
   quotationCounts,
+  uploadQuotationPdf,
 } from "../controllers/quotation.controller";
 import { authenticate } from "../middlewares/auth.middleware";
+import { createPdfUpload } from "../config/s3";
 import {
   authenticateUser,
   optionalAuthenticateUser,
@@ -22,10 +24,17 @@ import {
 import { authenticateVendor } from "../middlewares/vendorAuth.middleware";
 
 const router = Router();
+const quotationPdfUpload = createPdfUpload("quotations");
 
 // ===== Customer (mobile) routes =====
 // Submission is allowed without auth (guest), but if a token is present we link to the user.
-router.post("/", optionalAuthenticateUser, createQuotation);
+// An optional PDF (e.g. a BOQ / requirement list) may be attached as "pdf".
+router.post(
+  "/",
+  optionalAuthenticateUser,
+  quotationPdfUpload.single("pdf"),
+  createQuotation,
+);
 
 // "My" routes require auth
 router.get("/me", authenticateUser, listMyQuotations);
@@ -41,6 +50,12 @@ router.get("/", authenticate, listQuotations);
 router.get("/counts", authenticate, quotationCounts);
 router.get("/:id", authenticate, getQuotation);
 router.patch("/:id/respond", authenticate, respondToQuotation);
+router.patch(
+  "/:id/pdf",
+  authenticate,
+  quotationPdfUpload.single("pdf"),
+  uploadQuotationPdf,
+);
 router.patch("/:id/status", authenticate, updateQuotationStatus);
 router.patch("/:id/assign-vendor", authenticate, assignVendorToQuotation);
 router.delete("/:id", authenticate, deleteQuotation);

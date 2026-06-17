@@ -1,5 +1,54 @@
 import mongoose, { Schema, Document } from "mongoose";
 
+// Full order-lifecycle status set. `confirmed` is kept as a LEGACY alias of
+// `accepted` (older bookings carry it); both are treated as "accepted" in any
+// grouping/timeline logic.
+export type BookingStatus =
+  | "pending"
+  | "accepted"
+  | "qc_pending"
+  | "qc_approved"
+  | "packed"
+  | "dispatched"
+  | "in_transit"
+  | "delivered"
+  | "cancelled"
+  | "confirmed"; // legacy alias of "accepted"
+
+export const BOOKING_STATUSES: BookingStatus[] = [
+  "pending",
+  "accepted",
+  "qc_pending",
+  "qc_approved",
+  "packed",
+  "dispatched",
+  "in_transit",
+  "delivered",
+  "cancelled",
+  "confirmed",
+];
+
+export interface IBookingQC {
+  submittedAt: Date;
+  materialPhotos: string[];
+  packagingPhotos: string[];
+  note?: string;
+}
+
+export interface IBookingDispatch {
+  dispatchedAt: Date;
+  dispatchDate?: Date;
+  dispatchTime?: string;
+  vehicleNumber?: string;
+  driverName?: string;
+}
+
+export interface IBookingStatusHistory {
+  status: string;
+  at: Date;
+  note?: string;
+}
+
 export interface IBookingDocument extends Document {
   bookingId: string;
   user: mongoose.Types.ObjectId;
@@ -13,10 +62,16 @@ export interface IBookingDocument extends Document {
   price: number;
   totalAmount: number;
   site?: string;
-  status: "pending" | "confirmed" | "in_transit" | "delivered" | "cancelled";
+  status: BookingStatus;
   paymentStatus: "pending" | "partial" | "completed";
   paymentMethod?: string;
   notes?: string;
+  deliveryDate?: Date;
+  qc?: IBookingQC;
+  dispatch?: IBookingDispatch;
+  gstAmount?: number;
+  discountAmount?: number;
+  statusHistory?: IBookingStatusHistory[];
   isDeleted: boolean;
   deletedAt?: Date;
   deletedBy?: mongoose.Types.ObjectId;
@@ -89,7 +144,7 @@ const BookingSchema: Schema = new Schema(
     },
     status: {
       type: String,
-      enum: ["pending", "confirmed", "in_transit", "delivered", "cancelled"],
+      enum: BOOKING_STATUSES,
       default: "pending",
     },
     paymentStatus: {
@@ -104,6 +159,46 @@ const BookingSchema: Schema = new Schema(
     notes: {
       type: String,
       trim: true,
+    },
+    deliveryDate: {
+      type: Date,
+      default: null,
+    },
+    qc: {
+      submittedAt: { type: Date },
+      materialPhotos: { type: [String], default: [] },
+      packagingPhotos: { type: [String], default: [] },
+      note: { type: String, trim: true },
+    },
+    dispatch: {
+      dispatchedAt: { type: Date },
+      dispatchDate: { type: Date },
+      dispatchTime: { type: String, trim: true },
+      vehicleNumber: { type: String, trim: true },
+      driverName: { type: String, trim: true },
+    },
+    gstAmount: {
+      type: Number,
+      min: [0, "GST amount cannot be negative"],
+      default: 0,
+    },
+    discountAmount: {
+      type: Number,
+      min: [0, "Discount amount cannot be negative"],
+      default: 0,
+    },
+    statusHistory: {
+      type: [
+        new Schema(
+          {
+            status: { type: String, required: true },
+            at: { type: Date, required: true },
+            note: { type: String, trim: true },
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
     },
     isDeleted: {
       type: Boolean,
@@ -140,5 +235,25 @@ BookingSchema.index({ driver: 1, status: 1 });
 BookingSchema.index({ status: 1 });
 BookingSchema.index({ paymentStatus: 1 });
 BookingSchema.index({ createdAt: -1 });
+
+/**
+ * Apply a status transition to a booking: set the new status, append an entry
+ * to `statusHistory`, and stamp lifecycle timestamps (e.g. `deliveryDate` on
+ * delivery). This is the single source of truth for status changes — every
+ * vendor/driver transition should go through it so the customer tracking
+ * timeline stays consistent. Does NOT save; the caller persists.
+ */
+export const pushStatus = (
+  booking: IBookingDocument,
+  status: BookingStatus,
+  note?: string,
+): void => {
+  booking.status = status;
+  if (!Array.isArray(booking.statusHistory)) booking.statusHistory = [];
+  booking.statusHistory.push({ status, at: new Date(), note });
+  if (status === "delivered" && !booking.deliveryDate) {
+    booking.deliveryDate = new Date();
+  }
+};
 
 export default mongoose.model<IBookingDocument>("Booking", BookingSchema);

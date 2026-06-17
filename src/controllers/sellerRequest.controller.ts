@@ -6,6 +6,8 @@ import User from "../models/User.model";
 import { AuthRequest } from "../types";
 import { UserRequest } from "../middlewares/userAuth.middleware";
 import { AppError } from "../middlewares/errorHandler";
+import { sendMail } from "../services/mailer";
+import { sellerApprovedEmail } from "../services/emailTemplates";
 
 // ===================== CUSTOMER (mobile) =====================
 
@@ -266,6 +268,25 @@ export const approveSellerRequest = async (
     request.reviewedBy = new mongoose.Types.ObjectId(req.admin!._id);
     request.reviewedAt = new Date();
     await request.save();
+
+    // Notify the seller by email (fire-and-forget; never blocks approval).
+    if (request.email) {
+      const { subject, html, text } = sellerApprovedEmail({
+        name: request.name,
+        businessName: request.business?.name,
+      });
+      sendMail({ to: request.email, subject, html, text }).then((sent) => {
+        if (sent) {
+          console.log(
+            `[sellerRequest] Approval email sent to ${request.email}`,
+          );
+        }
+      });
+    } else {
+      console.warn(
+        `[sellerRequest] Request ${request._id} approved but has no email — skipping notification.`,
+      );
+    }
 
     res.json({
       success: true,

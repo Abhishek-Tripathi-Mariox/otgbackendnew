@@ -7,6 +7,10 @@ import {
   updateProfile,
   updateFCMToken,
   logout,
+  listAddresses,
+  addAddress,
+  updateAddress,
+  deleteAddress,
 } from "../controllers/mobileAuth.controller";
 import { authenticateUser } from "../middlewares/userAuth.middleware";
 
@@ -22,5 +26,11 @@ router.get("/me", authenticateUser, getMe);
 router.put("/profile", authenticateUser, updateProfile);
 router.put("/fcm-token", authenticateUser, updateFCMToken);
 router.post("/logout", authenticateUser, logout);
+
+// Saved addresses (address book)
+router.get("/addresses", authenticateUser, listAddresses);
+router.post("/addresses", authenticateUser, addAddress);
+router.put("/addresses/:addrId", authenticateUser, updateAddress);
+router.delete("/addresses/:addrId", authenticateUser, deleteAddress);
 
 export default router;

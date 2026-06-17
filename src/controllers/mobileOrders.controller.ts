@@ -37,7 +37,18 @@ export const listMyOrders = async (
     const query: any = { user: userId, isDeleted: false };
 
     if (status === "ongoing") {
-      query.status = { $in: ["pending", "confirmed", "in_transit"] };
+      query.status = {
+        $in: [
+          "pending",
+          "accepted",
+          "confirmed",
+          "qc_pending",
+          "qc_approved",
+          "packed",
+          "dispatched",
+          "in_transit",
+        ],
+      };
     } else if (status === "past") {
       query.status = { $in: ["delivered", "cancelled"] };
     }
@@ -118,6 +129,25 @@ export const createOrderFromCart = async (
       couponCode?: string;
     };
 
+    // Optional per-line GST sent by the customer app. Supports two shapes:
+    //   items: [{ materialId, quantity, gstAmount? }]  (preferred)
+    //   gstAmounts: { [materialId]: number }           (fallback)
+    // If absent, GST is derived from material.gst at create time.
+    const gstByMaterialId = new Map<string, number>();
+    if (Array.isArray(items)) {
+      for (const it of items) {
+        const g = Number((it as any)?.gstAmount);
+        if (Number.isFinite(g)) gstByMaterialId.set(it.materialId, g);
+      }
+    }
+    const gstAmounts = (req.body as any)?.gstAmounts;
+    if (gstAmounts && typeof gstAmounts === "object") {
+      for (const [k, v] of Object.entries(gstAmounts)) {
+        const g = Number(v);
+        if (Number.isFinite(g)) gstByMaterialId.set(k, g);
+      }
+    }
+
     if (!Array.isArray(items) || items.length === 0) {
       throw new AppError("Cart is empty.", 400);
     }
@@ -193,6 +223,23 @@ export const createOrderFromCart = async (
       discountAllocated += lineDiscount;
 
       const totalAmount = Math.max(0, line.gross - lineDiscount);
+
+      // GST: the totalAmount is treated as GST-inclusive. If the customer app
+      // sends an explicit per-line gstAmount we honor it; otherwise we derive
+      // the embedded GST from the material's gst rate (material.gst is a
+      // percentage). If neither is available, gst is 0.
+      const sentGst = gstByMaterialId.get(line.material._id.toString());
+      let gstAmount = 0;
+      if (sentGst !== undefined && Number.isFinite(sentGst) && sentGst > 0) {
+        gstAmount = +sentGst.toFixed(2);
+      } else {
+        const rate = Number(line.material.gst) || 0;
+        if (rate > 0) {
+          // Embedded GST within the (inclusive) totalAmount.
+          gstAmount = +(totalAmount - totalAmount / (1 + rate / 100)).toFixed(2);
+        }
+      }
+
       const bookingId = await generateBookingId();
 
       // Auto-allocate to nearest stocking vendor within radius
@@ -210,10 +257,13 @@ export const createOrderFromCart = async (
         unit: line.material.unit,
         price: line.price,
         totalAmount,
+        gstAmount,
+        discountAmount: +lineDiscount.toFixed(2),
         site,
         notes,
         paymentMethod,
         createdBy: userId,
+        statusHistory: [{ status: "pending", at: new Date() }],
       });
 
       const populated = await Booking.findById(booking._id)
@@ -241,6 +291,137 @@ export const createOrderFromCart = async (
       message: `${created.length} order(s) placed successfully.`,
       data: created,
       discountApplied: totalDiscount,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Order of lifecycle steps the customer tracking timeline renders. Each step
+// maps to one-or-more real booking statuses; once the booking has passed (or is
+// at) a step, that step is marked done with the timestamp from statusHistory.
+const TRACKING_STEPS: Array<{
+  key: string;
+  label: string;
+  statuses: string[];
+}> = [
+  { key: "placed", label: "Placed", statuses: ["pending"] },
+  {
+    key: "accepted",
+    label: "Accepted",
+    statuses: ["accepted", "confirmed"],
+  },
+  {
+    key: "qc",
+    label: "QC",
+    statuses: ["qc_pending", "qc_approved"],
+  },
+  { key: "packed", label: "Packed", statuses: ["packed"] },
+  { key: "dispatched", label: "Dispatched", statuses: ["dispatched"] },
+  {
+    key: "out_for_delivery",
+    label: "Out for delivery",
+    statuses: ["in_transit"],
+  },
+  { key: "delivered", label: "Delivered", statuses: ["delivered"] },
+];
+
+// Linear rank of a status within the lifecycle, used to decide which steps are
+// already "done". `confirmed` ranks with `accepted`.
+const STATUS_RANK: Record<string, number> = {
+  pending: 0,
+  accepted: 1,
+  confirmed: 1,
+  qc_pending: 2,
+  qc_approved: 2,
+  packed: 3,
+  dispatched: 4,
+  in_transit: 5,
+  delivered: 6,
+  cancelled: 6,
+};
+
+/**
+ * GET /api/mobile/orders/:id/tracking
+ * Returns a normalized delivery timeline for one of the user's bookings.
+ */
+export const getOrderTracking = async (
+  req: UserRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) throw new AppError("Unauthorized", 401);
+
+    const raw = String(req.params.id || "").trim();
+    const isObjectId = /^[a-fA-F0-9]{24}$/.test(raw);
+    const orQuery: any[] = isObjectId
+      ? [{ _id: raw }, { bookingId: raw.toUpperCase() }]
+      : [{ bookingId: raw.toUpperCase() }];
+
+    const booking: any = await Booking.findOne({
+      user: userId,
+      isDeleted: false,
+      $or: orQuery,
+    })
+      .populate("driver", "name vehicles.registrationNo")
+      .lean();
+
+    if (!booking) throw new AppError("Order not found.", 404);
+
+    const history: Array<{ status: string; at: Date }> =
+      booking.statusHistory || [];
+    // First timestamp recorded for each status (for the step "at" field).
+    const firstAt = new Map<string, Date>();
+    for (const h of history) {
+      if (!firstAt.has(h.status)) firstAt.set(h.status, h.at);
+    }
+
+    const currentRank = STATUS_RANK[booking.status as string] ?? 0;
+    const cancelled = booking.status === "cancelled";
+
+    const steps = TRACKING_STEPS.map(step => {
+      const stepRank = STATUS_RANK[step.statuses[0]] ?? 0;
+      const done = !cancelled && currentRank >= stepRank;
+      // Earliest matching timestamp for any of the step's statuses.
+      let at: Date | null = null;
+      for (const s of step.statuses) {
+        const t = firstAt.get(s);
+        if (t && (!at || t < at)) at = t;
+      }
+      // Fall back to createdAt for the "Placed" step on legacy bookings.
+      if (!at && step.key === "placed") at = booking.createdAt;
+      return { key: step.key, label: step.label, done, at: at || null };
+    });
+
+    const driverDoc = booking.driver;
+    const driver = driverDoc
+      ? {
+          name: driverDoc.name || booking.dispatch?.driverName || "Driver",
+          vehicleNumber:
+            driverDoc.vehicles?.[0]?.registrationNo ||
+            booking.dispatch?.vehicleNumber ||
+            null,
+        }
+      : booking.dispatch?.driverName
+        ? {
+            name: booking.dispatch.driverName,
+            vehicleNumber: booking.dispatch.vehicleNumber || null,
+          }
+        : null;
+
+    res.json({
+      success: true,
+      data: {
+        bookingId: booking.bookingId,
+        status: booking.status,
+        cancelled,
+        steps,
+        driver,
+        deliveryDate: booking.deliveryDate || null,
+        dropAddress: booking.site || null,
+      },
     });
   } catch (error) {
     next(error);

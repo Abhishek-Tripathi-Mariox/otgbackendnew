@@ -3,6 +3,7 @@ import mongoose, { Document, Schema } from "mongoose";
 export interface ICategory extends Document {
   name: string;
   image: string;
+  order: number;
   status: "active" | "inactive";
   isDeleted: boolean;
   deletedAt: Date | null;
@@ -25,6 +26,10 @@ const categorySchema = new Schema<ICategory>(
     image: {
       type: String,
       required: [true, "Category image is required"],
+    },
+    order: {
+      type: Number,
+      default: 0,
     },
     status: {
       type: String,

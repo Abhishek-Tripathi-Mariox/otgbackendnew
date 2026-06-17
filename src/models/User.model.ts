@@ -18,6 +18,14 @@ export interface IUserDocument extends Document {
       coordinates: [number, number];
     };
   };
+  addresses?: Array<{
+    _id?: mongoose.Types.ObjectId;
+    label?: string;
+    line?: string;
+    lat?: number;
+    lng?: number;
+    isDefault?: boolean;
+  }>;
   status: "active" | "inactive" | "blocked";
   isVerified: boolean;
   deviceInfo?: {
@@ -93,6 +101,20 @@ const UserSchema: Schema = new Schema(
           type: [Number], // [longitude, latitude]
         },
       },
+    },
+    // Customer's saved delivery addresses (address book). Subdocs get _id
+    // automatically so individual entries can be updated/deleted by id.
+    addresses: {
+      type: [
+        new Schema({
+          label: { type: String, trim: true },
+          line: { type: String, trim: true },
+          lat: { type: Number },
+          lng: { type: Number },
+          isDefault: { type: Boolean, default: false },
+        }),
+      ],
+      default: [],
     },
     status: {
       type: String,

@@ -43,6 +43,13 @@ export interface IQuotationDocument extends Document {
   adminNotes?: string;
   respondedBy?: mongoose.Types.ObjectId;
   respondedAt?: Date;
+  
+  // Uploaded quotation document (PDF stored on S3)
+  quotationPdf?: {
+    url: string;
+    name?: string;
+    uploadedAt?: Date;
+  } | null;
 
   // Vendor allocation (admin assigns; assigned vendor sees the request)
   assignedVendor?: mongoose.Types.ObjectId | null;
@@ -144,6 +151,18 @@ const QuotationSchema: Schema = new Schema(
       default: null,
     },
     respondedAt: { type: Date, default: null },
+
+    quotationPdf: {
+      type: new Schema(
+        {
+          url: { type: String, trim: true },
+          name: { type: String, trim: true },
+          uploadedAt: { type: Date, default: Date.now },
+        },
+        { _id: false },
+      ),
+      default: null,
+    },
 
     assignedVendor: {
       type: Schema.Types.ObjectId,

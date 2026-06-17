@@ -85,6 +85,33 @@ export const createUpload = (
   });
 };
 
+// File filter allowing PDF documents (used for uploaded paperwork like quotations)
+const pdfFileFilter = (
+  req: Express.Request,
+  file: Express.Multer.File,
+  cb: multer.FileFilterCallback,
+) => {
+  if (file.mimetype === "application/pdf") {
+    cb(null, true);
+  } else {
+    cb(new Error("Invalid file type. Only PDF files are allowed."));
+  }
+};
+
+// Factory function to create a PDF upload middleware for a specific folder
+export const createPdfUpload = (
+  folder: string,
+  maxSize: number = 10 * 1024 * 1024,
+) => {
+  return multer({
+    storage: createS3Storage(folder),
+    fileFilter: pdfFileFilter,
+    limits: {
+      fileSize: maxSize,
+    },
+  });
+};
+
 // Delete file from S3
 export const deleteFromS3 = async (fileUrl: string): Promise<boolean> => {
   try {

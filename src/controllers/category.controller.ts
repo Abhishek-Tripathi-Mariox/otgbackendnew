@@ -49,7 +49,7 @@ export const getCategories = async (
         .populate("createdBy", "name email")
         .populate("updatedBy", "name email")
         .populate("deletedBy", "name email")
-        .sort({ createdAt: -1 })
+        .sort({ order: 1, createdAt: -1 })
         .skip(skip)
         .limit(limitNum),
       Category.countDocuments(query),
@@ -104,7 +104,7 @@ export const createCategory = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const { name, status = "active" } = req.body;
+    const { name, status = "active", order } = req.body;
 
     if (!name) {
       throw new AppError("Category name is required", 400);
@@ -131,6 +131,7 @@ export const createCategory = async (
     const category = new Category({
       name,
       status,
+      order: order !== undefined ? Number(order) || 0 : 0,
       image: (req.file as any).location,
       createdBy: req.admin?._id,
     });
@@ -164,7 +165,7 @@ export const updateCategory = async (
 ): Promise<void> => {
   try {
     const { id } = req.params;
-    const { name, status } = req.body;
+    const { name, status, order } = req.body;
 
     const category = await Category.findOne({ _id: id, isDeleted: false });
 
@@ -195,6 +196,10 @@ export const updateCategory = async (
 
     if (status) {
       category.status = status;
+    }
+
+    if (order !== undefined) {
+      category.order = Number(order) || 0;
     }
 
     // Update image if new file uploaded

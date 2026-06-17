@@ -1,12 +1,24 @@
 import { Response, NextFunction } from "express";
 import mongoose from "mongoose";
-import Booking from "../models/Booking.model";
+import Booking, { pushStatus } from "../models/Booking.model";
 import { AppError } from "../middlewares/errorHandler";
 import { DriverRequest } from "../middlewares/driverAuth.middleware";
 
 type UiStatus = "in_progress" | "delivered" | "rejected";
 
-const ACTIVE_STATUSES = ["confirmed", "in_transit"];
+// A driver becomes responsible for an order the moment the vendor dispatches it
+// (status `dispatched`); from there the driver moves it pickup → in_transit →
+// delivered. `accepted`/`confirmed`/`packed` are included so a pre-assigned
+// driver still sees the order while the vendor is preparing it.
+const ACTIVE_STATUSES = [
+  "accepted",
+  "confirmed",
+  "packed",
+  "dispatched",
+  "in_transit",
+];
+// Statuses the driver can act on as a "new offer" awaiting pickup.
+const OFFER_STATUSES = ["dispatched"];
 const COMPLETED_STATUSES = ["delivered"];
 const REJECTED_STATUSES = ["cancelled"];
 
@@ -152,21 +164,27 @@ export const updateOrderStatus = async (
     if (!booking) throw new AppError("Order not found", 404);
 
     if (action === "accept") {
-      if (booking.status !== "pending") {
+      // Driver accepts a dispatched offer. (Legacy: pre-dispatch `pending`
+      // assignments are still acceptable for backward compatibility.)
+      if (!["dispatched", "pending"].includes(booking.status)) {
         throw new AppError(
-          "Only pending orders can be accepted.",
+          "Only dispatched offers can be accepted.",
           400,
         );
       }
-      booking.status = "confirmed";
+      // Acceptance keeps the order at `dispatched` (driver has it, not yet
+      // moving); pickup is the next step. We stamp history without changing
+      // the lifecycle status so the customer timeline stays accurate.
+      pushStatus(booking, "dispatched", "Driver accepted");
     } else if (action === "start") {
-      if (booking.status !== "confirmed") {
+      // "Pickup" — driver has collected the load and is en route.
+      if (!["dispatched", "packed", "confirmed", "accepted"].includes(booking.status)) {
         throw new AppError(
-          "Only confirmed orders can be started.",
+          "Only dispatched orders can be picked up.",
           400,
         );
       }
-      booking.status = "in_transit";
+      pushStatus(booking, "in_transit", "Picked up");
     } else if (action === "complete") {
       if (booking.status !== "in_transit") {
         throw new AppError(
@@ -174,15 +192,20 @@ export const updateOrderStatus = async (
           400,
         );
       }
-      booking.status = "delivered";
+      // pushStatus stamps deliveryDate = now on delivery.
+      pushStatus(booking, "delivered", "Delivered");
     } else if (action === "reject") {
-      if (!["pending", "confirmed"].includes(booking.status)) {
+      if (
+        !["pending", "accepted", "confirmed", "packed", "dispatched"].includes(
+          booking.status,
+        )
+      ) {
         throw new AppError(
           "This order can no longer be rejected.",
           400,
         );
       }
-      booking.status = "cancelled";
+      pushStatus(booking, "cancelled", "Driver rejected");
       booking.driverRejectedAt = new Date();
     }
 
@@ -289,15 +312,16 @@ export const getDashboard = async (
       ]),
       periodAgg(weekStart),
       periodAgg(monthStart),
-      // A "new offer" = a pending booking assigned to this driver waiting acceptance.
+      // A "new offer" = a dispatched booking assigned to this driver awaiting
+      // pickup. (driverRejectedAt is cleared on dispatch, so this is fresh.)
       populateBooking(
         Booking.findOne({
           driver: driverId,
           isDeleted: false,
-          status: "pending",
+          status: { $in: OFFER_STATUSES },
         }).sort({ createdAt: -1 }),
       ),
-      // The currently in-progress order (confirmed or in_transit).
+      // The currently in-progress order.
       populateBooking(
         Booking.findOne({
           driver: driverId,

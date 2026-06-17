@@ -487,6 +487,143 @@ export const updateFCMToken = async (
 };
 
 /**
+ * Load the authenticated user, guarding for missing/blocked accounts.
+ */
+const loadActiveUser = async (userId?: string) => {
+  if (!userId) throw new AppError("Unauthorized", 401);
+  const user = await User.findById(userId);
+  if (!user || user.isDeleted) throw new AppError("User not found", 404);
+  if (user.status === "blocked") {
+    throw new AppError("Your account has been blocked", 403);
+  }
+  return user;
+};
+
+/**
+ * List saved addresses (authenticated)
+ * GET /api/mobile/auth/addresses
+ */
+export const listAddresses = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const user = await loadActiveUser((req as any).user?.id);
+    res.json({ success: true, data: user.addresses || [] });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Add a saved address (authenticated)
+ * POST /api/mobile/auth/addresses  body: { label, line, lat?, lng?, isDefault? }
+ */
+export const addAddress = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const user = await loadActiveUser((req as any).user?.id);
+    const { label, line, lat, lng, isDefault } = req.body || {};
+
+    if (!line) throw new AppError("Address line is required", 400);
+
+    if (!Array.isArray(user.addresses)) user.addresses = [];
+
+    // First address is default by default; an explicit isDefault demotes others.
+    const makeDefault = isDefault === true || user.addresses.length === 0;
+    if (makeDefault) {
+      user.addresses.forEach(a => {
+        a.isDefault = false;
+      });
+    }
+
+    user.addresses.push({
+      label: label || undefined,
+      line,
+      lat: typeof lat === "number" ? lat : undefined,
+      lng: typeof lng === "number" ? lng : undefined,
+      isDefault: makeDefault,
+    });
+
+    await user.save();
+    res.status(201).json({ success: true, data: user.addresses });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Update a saved address (authenticated)
+ * PUT /api/mobile/auth/addresses/:addrId
+ */
+export const updateAddress = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const user = await loadActiveUser((req as any).user?.id);
+    const { addrId } = req.params;
+    const { label, line, lat, lng, isDefault } = req.body || {};
+
+    const addr = (user.addresses as any)?.id?.(addrId);
+    if (!addr) throw new AppError("Address not found", 404);
+
+    if (label !== undefined) addr.label = label || undefined;
+    if (line !== undefined) addr.line = line;
+    if (lat !== undefined) addr.lat = typeof lat === "number" ? lat : undefined;
+    if (lng !== undefined) addr.lng = typeof lng === "number" ? lng : undefined;
+
+    if (isDefault === true) {
+      user.addresses!.forEach(a => {
+        a.isDefault = false;
+      });
+      addr.isDefault = true;
+    }
+
+    await user.save();
+    res.json({ success: true, data: user.addresses });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Delete a saved address (authenticated)
+ * DELETE /api/mobile/auth/addresses/:addrId
+ */
+export const deleteAddress = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const user = await loadActiveUser((req as any).user?.id);
+    const { addrId } = req.params;
+
+    const addr = (user.addresses as any)?.id?.(addrId);
+    if (!addr) throw new AppError("Address not found", 404);
+
+    const wasDefault = addr.isDefault;
+    addr.deleteOne();
+
+    // Promote the first remaining address to default if we removed the default.
+    if (wasDefault && user.addresses && user.addresses.length > 0) {
+      user.addresses[0].isDefault = true;
+    }
+
+    await user.save();
+    res.json({ success: true, data: user.addresses });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
  * Logout (authenticated)
  * POST /api/mobile/auth/logout
  */

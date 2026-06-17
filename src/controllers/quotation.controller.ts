@@ -6,6 +6,7 @@ import { AuthRequest } from "../types";
 import { UserRequest } from "../middlewares/userAuth.middleware";
 import { VendorRequest } from "../middlewares/vendorAuth.middleware";
 import { AppError } from "../middlewares/errorHandler";
+import { deleteFromS3 } from "../config/s3";
 
 const normalizeMobile = (m: string): string =>
   String(m || "").replace(/^\+91/, "").replace(/\s+/g, "").trim();
@@ -65,15 +66,38 @@ export const createQuotation = async (
       throw new AppError("Enter a valid 10-digit mobile number", 400);
     }
 
+    // When submitted as multipart/form-data (PDF attached), array/object fields
+    // arrive as JSON strings — normalise them back to objects.
+    let itemsInput = items;
+    if (typeof itemsInput === "string") {
+      try {
+        itemsInput = JSON.parse(itemsInput);
+      } catch {
+        itemsInput = [];
+      }
+    }
+
     let cleanedItems: any[] = [];
-    if (Array.isArray(items) && items.length > 0) {
-      cleanedItems = items
+    if (Array.isArray(itemsInput) && itemsInput.length > 0) {
+      cleanedItems = itemsInput
         .map(sanitizeItem)
         .filter((i) => i !== null) as any[];
       if (cleanedItems.length === 0) {
         throw new AppError("Please add at least one item", 400);
       }
     }
+
+    // Optional PDF attached by the customer (e.g. a BOQ / requirement list).
+    const uploadedPdf = req.file as
+      | (Express.Multer.File & { location?: string })
+      | undefined;
+    const quotationPdf = uploadedPdf?.location
+      ? {
+          url: uploadedPdf.location,
+          name: uploadedPdf.originalname,
+          uploadedAt: new Date(),
+        }
+      : undefined;
 
     const quotation = await Quotation.create({
       user: req.user?.id || undefined,
@@ -95,6 +119,7 @@ export const createQuotation = async (
           : undefined,
       unit: cleanedItems.length === 0 && unit ? String(unit).trim() : undefined,
       materialRequirement: materialRequirement?.trim() || undefined,
+      quotationPdf,
       status: "new",
     });
 
@@ -290,6 +315,45 @@ export const respondToQuotation = async (
     res.json({
       success: true,
       message: "Quotation responded successfully",
+      data: quotation,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Admin uploads (or replaces) a PDF document against a quotation
+export const uploadQuotationPdf = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const file = req.file as Express.Multer.File & { location?: string };
+
+    if (!file || !file.location) {
+      throw new AppError("Please attach a PDF file", 400);
+    }
+
+    const quotation = await Quotation.findById(id);
+    if (!quotation) throw new AppError("Quotation not found", 404);
+
+    // Remove the previously uploaded PDF (if any) to avoid orphaned files.
+    if (quotation.quotationPdf?.url) {
+      await deleteFromS3(quotation.quotationPdf.url);
+    }
+
+    quotation.quotationPdf = {
+      url: file.location,
+      name: file.originalname,
+      uploadedAt: new Date(),
+    };
+    await quotation.save();
+
+    res.json({
+      success: true,
+      message: "Quotation PDF uploaded",
       data: quotation,
     });
   } catch (error) {

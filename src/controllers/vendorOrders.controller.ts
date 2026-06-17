@@ -1,9 +1,14 @@
 import { Response, NextFunction } from "express";
 import mongoose from "mongoose";
-import Booking from "../models/Booking.model";
+import Booking, { pushStatus } from "../models/Booking.model";
 import Vendor from "../models/Vendor.model";
+import Driver from "../models/Driver.model";
 import { AppError } from "../middlewares/errorHandler";
 import { VendorRequest } from "../middlewares/vendorAuth.middleware";
+import {
+  findAssignableDrivers,
+  findFirstAvailableDriver,
+} from "../utils/vendorAllocation";
 
 type UiStatus =
   | "Pending"
@@ -12,20 +17,37 @@ type UiStatus =
   | "QC Approved"
   | "Packed"
   | "Dispatched"
-  | "Delivered";
+  | "In Transit"
+  | "Delivered"
+  | "Cancelled";
 
+// Map each real booking status to the label the vendor UI shows. `confirmed`
+// is the legacy alias of `accepted`.
 const RAW_TO_UI: Record<string, UiStatus> = {
   pending: "Pending",
+  accepted: "Accepted",
   confirmed: "Accepted",
-  in_transit: "Dispatched",
+  qc_pending: "QC Pending",
+  qc_approved: "QC Approved",
+  packed: "Packed",
+  dispatched: "Dispatched",
+  in_transit: "In Transit",
   delivered: "Delivered",
+  cancelled: "Cancelled",
 };
 
+// Reverse map for the ?status= list filter. Each UI label maps to the set of
+// real statuses it covers (Accepted covers the legacy `confirmed`).
 const UI_TO_RAW: Partial<Record<UiStatus, string[]>> = {
   Pending: ["pending"],
-  Accepted: ["confirmed"],
-  Dispatched: ["in_transit"],
+  Accepted: ["accepted", "confirmed"],
+  "QC Pending": ["qc_pending"],
+  "QC Approved": ["qc_approved"],
+  Packed: ["packed"],
+  Dispatched: ["dispatched"],
+  "In Transit": ["in_transit"],
   Delivered: ["delivered"],
+  Cancelled: ["cancelled"],
 };
 
 const formatDate = (d?: Date | string | null): string => {
@@ -50,10 +72,14 @@ const formatBooking = (booking: any) => {
   const unit = booking.unit || material?.unit || "";
   const quantityText = `${booking.quantity} ${unit}`.trim();
 
-  // Use updatedAt as the proxy "delivery target" since the Booking model
-  // doesn't carry an explicit delivery date today. The list UI shows this as
-  // "Delivery Date" / "Due"; switching to a real field later is a one-line change.
-  const deliveryDate = formatDate(booking.updatedAt || booking.createdAt);
+  // Prefer the real delivery date once delivered; fall back to the dispatch
+  // date, then to updatedAt as a last-resort proxy for the list "Due" column.
+  const deliveryDate = formatDate(
+    booking.deliveryDate ||
+      booking.dispatch?.dispatchDate ||
+      booking.updatedAt ||
+      booking.createdAt,
+  );
 
   const user = booking.user;
   const customerName = user?.name || "Customer";
@@ -81,6 +107,9 @@ const formatBooking = (booking: any) => {
       name: customerName,
       mobile: customerMobile,
     },
+    qc: booking.qc || null,
+    dispatch: booking.dispatch || null,
+    statusHistory: booking.statusHistory || [],
     createdAt: booking.createdAt,
     updatedAt: booking.updatedAt,
   };
@@ -94,6 +123,20 @@ const populateBooking = (q: any) =>
       populate: { path: "category", select: "name" },
     })
     .populate("user", "name mobile");
+
+// Resolve a booking owned by the vendor from either a Mongo _id or bookingId.
+const findVendorBooking = async (vendorId: string, rawId: string) => {
+  const raw = String(rawId || "").trim();
+  const isObjectId = /^[a-fA-F0-9]{24}$/.test(raw);
+  const orQuery: any[] = isObjectId
+    ? [{ _id: raw }, { bookingId: raw.toUpperCase() }]
+    : [{ bookingId: raw.toUpperCase() }];
+  return Booking.findOne({
+    vendor: new mongoose.Types.ObjectId(vendorId),
+    isDeleted: false,
+    $or: orQuery,
+  });
+};
 
 /**
  * GET /api/vendor/orders
@@ -207,12 +250,12 @@ export const updateOrderStatus = async (
       if (booking.status !== "pending") {
         throw new AppError("Only pending orders can be accepted.", 400);
       }
-      booking.status = "confirmed";
+      pushStatus(booking, "accepted");
     } else if (action === "reject") {
-      if (!["pending", "confirmed"].includes(booking.status)) {
+      if (!["pending", "accepted", "confirmed"].includes(booking.status)) {
         throw new AppError("This order can no longer be rejected.", 400);
       }
-      booking.status = "cancelled";
+      pushStatus(booking, "cancelled", reason);
       if (reason) {
         booking.notes = `${booking.notes ? booking.notes + "\n" : ""}Rejected: ${reason}`;
       }
@@ -308,7 +351,11 @@ export const getOrderCounts = async (
       total: 0,
       Pending: 0,
       Accepted: 0,
+      "QC Pending": 0,
+      "QC Approved": 0,
+      Packed: 0,
       Dispatched: 0,
+      "In Transit": 0,
       Delivered: 0,
       Cancelled: 0,
     };
@@ -316,8 +363,8 @@ export const getOrderCounts = async (
     rows.forEach(r => {
       counts.total += r.count;
       const ui = RAW_TO_UI[r._id as string];
-      if (ui) counts[ui] = r.count;
-      if (r._id === "cancelled") counts.Cancelled = r.count;
+      // Accepted aggregates both `accepted` and legacy `confirmed`.
+      if (ui) counts[ui] = (counts[ui] || 0) + r.count;
     });
 
     res.json({ success: true, data: counts });
@@ -434,6 +481,192 @@ export const getOrderInvoice = async (
         },
         notes: booking.notes || null,
       },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * PATCH /api/vendor/orders/:bookingId/qc
+ * Body: { materialPhotos?: string[], packagingPhotos?: string[], note?: string }
+ * Records QC submission and moves the order to `qc_approved`. Photos are plain
+ * URL/strings (already-uploaded URLs) — there is NO multipart handling here.
+ * Allowed from: accepted | confirmed (legacy) | qc_pending.
+ */
+export const submitQC = async (
+  req: VendorRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const vendorId = req.vendor!.id;
+    const { materialPhotos, packagingPhotos, note } = req.body as {
+      materialPhotos?: string[];
+      packagingPhotos?: string[];
+      note?: string;
+    };
+
+    const booking = await findVendorBooking(vendorId, req.params.id);
+    if (!booking) throw new AppError("Order not found", 404);
+
+    if (!["accepted", "confirmed", "qc_pending"].includes(booking.status)) {
+      throw new AppError(
+        "QC can only be submitted on accepted orders.",
+        400,
+      );
+    }
+
+    booking.qc = {
+      submittedAt: new Date(),
+      materialPhotos: Array.isArray(materialPhotos) ? materialPhotos : [],
+      packagingPhotos: Array.isArray(packagingPhotos) ? packagingPhotos : [],
+      note: note || undefined,
+    };
+    pushStatus(booking, "qc_approved", note);
+
+    await booking.save();
+    const populated = await populateBooking(Booking.findById(booking._id));
+    res.json({ success: true, data: formatBooking(populated) });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * PATCH /api/vendor/orders/:bookingId/pack  body: { note?: string }
+ * Moves a QC-approved order to `packed`.
+ */
+export const packOrder = async (
+  req: VendorRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const vendorId = req.vendor!.id;
+    const { note } = req.body as { note?: string };
+
+    const booking = await findVendorBooking(vendorId, req.params.id);
+    if (!booking) throw new AppError("Order not found", 404);
+
+    if (!["qc_approved", "qc_pending"].includes(booking.status)) {
+      throw new AppError(
+        "Only QC-approved orders can be packed.",
+        400,
+      );
+    }
+
+    pushStatus(booking, "packed", note);
+
+    await booking.save();
+    const populated = await populateBooking(Booking.findById(booking._id));
+    res.json({ success: true, data: formatBooking(populated) });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * PATCH /api/vendor/orders/:bookingId/dispatch
+ * Body: { dispatchDate?, dispatchTime?, vehicleNumber?, driverId? }
+ * Records dispatch details, moves status to `dispatched`, and ASSIGNS A DRIVER.
+ * If `driverId` is supplied it is used; otherwise the first eligible
+ * (active + approved) driver is auto-assigned. This assignment is the
+ * cross-app link that makes the order visible in the driver app.
+ */
+export const dispatchOrder = async (
+  req: VendorRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const vendorId = req.vendor!.id;
+    const { dispatchDate, dispatchTime, vehicleNumber, driverId } =
+      req.body as {
+        dispatchDate?: string;
+        dispatchTime?: string;
+        vehicleNumber?: string;
+        driverId?: string;
+      };
+
+    const booking = await findVendorBooking(vendorId, req.params.id);
+    if (!booking) throw new AppError("Order not found", 404);
+
+    if (!["packed", "qc_approved"].includes(booking.status)) {
+      throw new AppError(
+        "Only packed orders can be dispatched.",
+        400,
+      );
+    }
+
+    // Resolve the driver: explicit pick, else auto-assign first eligible.
+    let driverName: string | undefined;
+    let assignedVehicle: string | undefined;
+    if (driverId) {
+      if (!/^[a-fA-F0-9]{24}$/.test(driverId)) {
+        throw new AppError("Invalid driverId.", 400);
+      }
+      const driver = await Driver.findOne({
+        _id: driverId,
+        status: "active",
+        approvalStatus: "approved",
+        isDeleted: false,
+      })
+        .select("name vehicles.registrationNo")
+        .lean();
+      if (!driver) {
+        throw new AppError("Selected driver is not assignable.", 400);
+      }
+      booking.driver = driver._id as mongoose.Types.ObjectId;
+      driverName = driver.name;
+      assignedVehicle = driver.vehicles?.[0]?.registrationNo;
+    } else {
+      const driver = await findFirstAvailableDriver();
+      if (driver) {
+        booking.driver = driver._id;
+        driverName = driver.name;
+        assignedVehicle = driver.vehicles?.[0]?.registrationNo;
+      }
+    }
+
+    booking.dispatch = {
+      dispatchedAt: new Date(),
+      dispatchDate: dispatchDate ? new Date(dispatchDate) : undefined,
+      dispatchTime: dispatchTime || undefined,
+      vehicleNumber: vehicleNumber || assignedVehicle || undefined,
+      driverName: driverName || undefined,
+    };
+    // Clear any prior rejection so a re-assigned driver sees a fresh offer.
+    booking.driverRejectedAt = undefined;
+    pushStatus(booking, "dispatched");
+
+    await booking.save();
+    const populated = await populateBooking(Booking.findById(booking._id));
+    res.json({ success: true, data: formatBooking(populated) });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * GET /api/vendor/orders/assignable-drivers
+ * Returns active + approved drivers for the dispatch driver picker.
+ * Shape: [{ id, name, vehicleNumber }]
+ */
+export const getAssignableDrivers = async (
+  _req: VendorRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const drivers = await findAssignableDrivers();
+    res.json({
+      success: true,
+      data: drivers.map(d => ({
+        id: String(d._id),
+        name: d.name || "Driver",
+        vehicleNumber: d.vehicles?.[0]?.registrationNo || null,
+      })),
     });
   } catch (error) {
     next(error);

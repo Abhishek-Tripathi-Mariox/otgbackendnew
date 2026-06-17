@@ -16,8 +16,8 @@ export const getCategories = async (
       isDeleted: false,
       status: "active",
     })
-      .select("name image")
-      .sort({ name: 1 });
+      .select("name image order")
+      .sort({ order: 1, name: 1 });
 
     res.json({
       success: true,

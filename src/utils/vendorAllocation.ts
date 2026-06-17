@@ -1,6 +1,7 @@
 import mongoose from "mongoose";
 import VendorMaterial from "../models/VendorMaterial.model";
 import Vendor from "../models/Vendor.model";
+import Driver from "../models/Driver.model";
 
 export const AUTO_ALLOCATE_RADIUS_KM = 50;
 
@@ -56,4 +57,45 @@ export async function findNearestVendorForMaterial(
     .lean();
 
   return (nearest?._id as mongoose.Types.ObjectId) || null;
+}
+
+/**
+ * Drivers eligible for dispatch assignment: active, approved, not deleted.
+ * Used both for the vendor's driver picker and for auto-assignment fallback.
+ */
+export async function findAssignableDrivers(): Promise<
+  Array<{
+    _id: mongoose.Types.ObjectId;
+    name?: string;
+    vehicles?: Array<{ registrationNo?: string }>;
+  }>
+> {
+  return Driver.find({
+    status: "active",
+    approvalStatus: "approved",
+    isDeleted: false,
+  })
+    .select("name vehicles.registrationNo")
+    .sort({ updatedAt: -1 })
+    .lean();
+}
+
+/**
+ * Auto-pick the first eligible (active + approved) driver for a dispatch when
+ * the vendor doesn't choose one explicitly. Returns the driver doc or null.
+ */
+export async function findFirstAvailableDriver(): Promise<{
+  _id: mongoose.Types.ObjectId;
+  name?: string;
+  vehicles?: Array<{ registrationNo?: string }>;
+} | null> {
+  const driver = await Driver.findOne({
+    status: "active",
+    approvalStatus: "approved",
+    isDeleted: false,
+  })
+    .select("name vehicles.registrationNo")
+    .sort({ updatedAt: -1 })
+    .lean();
+  return (driver as any) || null;
 }
