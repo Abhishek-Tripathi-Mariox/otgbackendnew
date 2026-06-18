@@ -89,6 +89,7 @@ export const getMaterials = async (
       limit = 20,
       category,
       subCategory,
+      brand,
       search,
     } = req.query;
 
@@ -107,6 +108,15 @@ export const getMaterials = async (
 
     if (subCategory) {
       query.subCategory = subCategory;
+    }
+
+    if (brand) {
+      // Material.brand is stored as the brand name string. Match exactly
+      // (case-insensitive) so "Shop by brand" lists only that brand's items.
+      query.brand = {
+        $regex: `^${String(brand).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+        $options: "i",
+      };
     }
 
     if (search) {
