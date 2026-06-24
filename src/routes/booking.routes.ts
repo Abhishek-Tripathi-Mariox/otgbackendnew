@@ -6,6 +6,7 @@ import {
   updateBooking,
   updateBookingStatus,
   allocateVendor,
+  allocateDriver,
   deleteBooking,
   getDashboardStats,
   getTopMaterials,
@@ -42,6 +43,9 @@ router.patch("/:id/status", updateBookingStatus);
 
 // Allocate vendor to booking (manual assignment)
 router.patch("/:id/vendor", allocateVendor);
+
+// Allocate driver to booking (manual assignment — dispatches to driver app)
+router.patch("/:id/driver", allocateDriver);
 
 // Delete booking (soft delete)
 router.delete("/:id", deleteBooking);

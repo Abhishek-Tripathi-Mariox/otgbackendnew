@@ -1,7 +1,8 @@
 import { Request, Response, NextFunction } from "express";
-import Booking from "../models/Booking.model";
+import Booking, { pushStatus, BOOKING_STATUSES } from "../models/Booking.model";
 import Material from "../models/Material.model";
 import Vendor from "../models/Vendor.model";
+import Driver from "../models/Driver.model";
 import { AppError } from "../middlewares/errorHandler";
 import { AuthRequest } from "../types";
 
@@ -220,20 +221,15 @@ export const updateBookingStatus = async (
     }
 
     if (status) {
-      const validStatuses = [
-        "pending",
-        "confirmed",
-        "in_transit",
-        "delivered",
-        "cancelled",
-      ];
-      if (!validStatuses.includes(status)) {
+      if (!BOOKING_STATUSES.includes(status)) {
         throw new AppError(
-          `Invalid status. Must be one of: ${validStatuses.join(", ")}`,
+          `Invalid status. Must be one of: ${BOOKING_STATUSES.join(", ")}`,
           400,
         );
       }
-      booking.status = status;
+      // Route through pushStatus so statusHistory + lifecycle timestamps stay
+      // consistent with the customer tracking timeline.
+      pushStatus(booking, status);
     }
 
     if (paymentStatus) {
@@ -315,6 +311,83 @@ export const allocateVendor = async (
   }
 };
 
+// Allocate (or change/unassign) the driver for a booking — admin action.
+// Assigning a driver dispatches the order so it immediately shows up in the
+// driver app (driver sees bookings where `driver` is set and status is active).
+export const allocateDriver = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const { driverId, vehicleNumber: pickedVehicle } = req.body as {
+      driverId?: string | null;
+      vehicleNumber?: string | null;
+    };
+
+    const booking = await Booking.findOne({ _id: id, isDeleted: false });
+    if (!booking) {
+      throw new AppError("Booking not found.", 404);
+    }
+
+    if (driverId) {
+      const driver = await Driver.findOne({
+        _id: driverId,
+        isDeleted: false,
+        approvalStatus: "approved",
+      }).select("_id name vehicles");
+      if (!driver) {
+        throw new AppError("Driver not found or not approved.", 400);
+      }
+
+      booking.driver = driver._id as any;
+      // Use the admin-chosen vehicle if provided (weight-based decision),
+      // otherwise default to the driver's first registered vehicle.
+      const vehicleNumber =
+        pickedVehicle ||
+        (driver as any).vehicles?.[0]?.registrationNo ||
+        undefined;
+      booking.dispatch = {
+        dispatchedAt: new Date(),
+        dispatchDate: booking.dispatch?.dispatchDate,
+        dispatchTime: booking.dispatch?.dispatchTime,
+        vehicleNumber: booking.dispatch?.vehicleNumber || vehicleNumber,
+        driverName: (driver as any).name,
+      };
+      // Move the order into the dispatched state so the driver app surfaces it
+      // (unless it's already further along the lifecycle).
+      if (
+        !["dispatched", "in_transit", "delivered"].includes(booking.status)
+      ) {
+        pushStatus(booking, "dispatched", "Driver assigned by admin");
+      }
+    } else {
+      // Explicit un-assignment with driverId: null
+      booking.driver = undefined;
+    }
+
+    booking.updatedBy = req.admin?._id as any;
+    await booking.save();
+
+    const populated = await Booking.findById(booking._id)
+      .populate("user", "name mobile email")
+      .populate("vendor", "name mobile email business")
+      .populate("driver", "name mobile vehicles")
+      .populate("material", "name images unit");
+
+    res.json({
+      success: true,
+      message: driverId
+        ? "Driver assigned to booking."
+        : "Driver unassigned from booking.",
+      data: populated,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 // Delete booking (soft delete)
 export const deleteBooking = async (
   req: AuthRequest,
@@ -360,13 +433,30 @@ export const getDashboardStats = async (
           _id: null,
           totalOrders: { $sum: 1 },
           pendingOrders: {
-            $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] },
+            $sum: {
+              $cond: [
+                {
+                  $in: [
+                    "$status",
+                    ["pending", "accepted", "qc_pending", "qc_approved"],
+                  ],
+                },
+                1,
+                0,
+              ],
+            },
           },
           confirmedOrders: {
             $sum: { $cond: [{ $eq: ["$status", "confirmed"] }, 1, 0] },
           },
           inTransitOrders: {
-            $sum: { $cond: [{ $eq: ["$status", "in_transit"] }, 1, 0] },
+            $sum: {
+              $cond: [
+                { $in: ["$status", ["packed", "dispatched", "in_transit"]] },
+                1,
+                0,
+              ],
+            },
           },
           deliveredOrders: {
             $sum: { $cond: [{ $eq: ["$status", "delivered"] }, 1, 0] },
@@ -402,7 +492,18 @@ export const getDashboardStats = async (
           _id: null,
           todayOrders: { $sum: 1 },
           todayPending: {
-            $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] },
+            $sum: {
+              $cond: [
+                {
+                  $in: [
+                    "$status",
+                    ["pending", "accepted", "qc_pending", "qc_approved"],
+                  ],
+                },
+                1,
+                0,
+              ],
+            },
           },
           todayCompleted: {
             $sum: { $cond: [{ $eq: ["$status", "delivered"] }, 1, 0] },

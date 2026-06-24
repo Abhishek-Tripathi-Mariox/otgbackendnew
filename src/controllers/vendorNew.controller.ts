@@ -354,8 +354,15 @@ export const updateVendor = async (
       vendor.markModified('business');
     }
 
+    // Vendors created via the vendor app onboarding have no createdBy.
+    // Backfill it so a full-document save doesn't fail on this path.
+    if (!vendor.createdBy) {
+      vendor.createdBy = new mongoose.Types.ObjectId(req.admin!._id);
+    }
     vendor.updatedBy = new mongoose.Types.ObjectId(req.admin!._id);
-    await vendor.save();
+    // Only validate the fields we actually changed — avoids validation/cast
+    // errors on legacy untouched paths (e.g. createdBy on older records).
+    await vendor.save({ validateModifiedOnly: true });
 
     const updatedVendor = await Vendor.findById(id)
       .populate("createdBy", "name email")

@@ -282,6 +282,7 @@ const VendorSchema: Schema = new Schema(
     createdBy: {
       type: Schema.Types.ObjectId,
       ref: "Admin",
+      default: null,
     },
     updatedBy: {
       type: Schema.Types.ObjectId,
