@@ -173,23 +173,35 @@ export const listMyOrders = async (
     // vendor's business pincode. Shown under "All Orders" or the Pending tab.
     const showClaimable =
       statusParam === "All Orders" || (rawList?.includes("pending") ?? false);
+    let claimablePincode = "";
     if (showClaimable) {
       const vendorDoc = await Vendor.findById(vendorId)
         .select("business.pincode")
         .lean();
-      const vendorPincode = vendorDoc?.business?.pincode;
+      const vendorPincode = (
+        String(vendorDoc?.business?.pincode ?? "").match(/\d{6}/) || []
+      )[0];
       if (vendorPincode) {
+        claimablePincode = vendorPincode;
         orConds.push({
           vendor: null,
           isDeleted: false,
           status: "pending",
-          pincode: vendorPincode,
+          // Match the 6-digit pincode even if stored with spaces / different format.
+          pincode: new RegExp(vendorPincode),
         });
       }
     }
 
     const bookings = await populateBooking(
       Booking.find({ $or: orConds }).sort({ createdAt: -1 }).limit(100),
+    );
+
+    const claimableCount = bookings.filter(
+      (b: any) => !b.vendor && b.status === "pending",
+    ).length;
+    console.log(
+      `[vendorOrders:list] vendor=${vendorId} pincode="${claimablePincode}" status="${statusParam}" total=${bookings.length} claimable=${claimableCount}`,
     );
 
     res.json({
@@ -221,13 +233,19 @@ export const getMyOrder = async (
     const vendorDoc = await Vendor.findById(vendorId)
       .select("business.pincode")
       .lean();
-    const vendorPincode = vendorDoc?.business?.pincode;
+    const vendorPincode = (
+      String(vendorDoc?.business?.pincode ?? "").match(/\d{6}/) || []
+    )[0];
 
     // Visible if assigned to this vendor OR a claimable (unassigned, pending,
     // matching-pincode) order.
     const ownership: any[] = [{ vendor: new mongoose.Types.ObjectId(vendorId) }];
     if (vendorPincode) {
-      ownership.push({ vendor: null, status: "pending", pincode: vendorPincode });
+      ownership.push({
+        vendor: null,
+        status: "pending",
+        pincode: new RegExp(vendorPincode),
+      });
     }
 
     const booking = await populateBooking(

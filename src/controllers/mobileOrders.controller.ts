@@ -211,17 +211,23 @@ export const createOrderFromCart = async (
     }>;
     const grossTotal = lines.reduce((s, l) => s + l.gross, 0) || 1;
 
-    // Resolve the delivery pincode. Vendors whose business pincode equals this
-    // will see the (unassigned) order and the first to accept claims it.
+    // Resolve the delivery pincode (normalized to the first 6-digit sequence,
+    // so spaces/formatting differences never break vendor matching). Vendors
+    // whose business pincode equals this see the unassigned order; first to
+    // accept claims it.
     const userDoc = await User.findById(userId)
       .select("address.pincode")
       .lean();
-    const sitePincodeMatch = String(site || "").match(/\b(\d{6})\b/);
+    const firstPin = (s: unknown): string =>
+      (String(s ?? "").match(/\d{6}/) || [])[0] || "";
     const deliveryPincode =
-      (typeof bodyPincode === "string" && bodyPincode.trim()) ||
-      (sitePincodeMatch ? sitePincodeMatch[1] : "") ||
-      userDoc?.address?.pincode ||
+      firstPin(bodyPincode) ||
+      firstPin(site) ||
+      firstPin(userDoc?.address?.pincode) ||
       "";
+    console.log(
+      `[order:create] user=${userId} deliveryPincode="${deliveryPincode}" (bodyPincode="${bodyPincode}", site="${site}")`,
+    );
 
     const created = [] as any[];
     let discountAllocated = 0;
@@ -291,13 +297,18 @@ export const createOrderFromCart = async (
     // Notify every active vendor whose business pincode matches the delivery
     // pincode that new claimable order(s) are available. First to accept wins.
     if (deliveryPincode) {
+      // Match the 6-digit pincode even if a vendor stored it with spaces.
       const matchingVendors = await Vendor.find({
-        "business.pincode": deliveryPincode,
+        "business.pincode": new RegExp(deliveryPincode),
         status: "active",
         isDeleted: false,
       })
         .select("_id")
         .lean();
+
+      console.log(
+        `[order:create] matching active vendors for pincode "${deliveryPincode}": ${matchingVendors.length}`,
+      );
 
       if (matchingVendors.length > 0) {
         const vendorIds = matchingVendors.map(v => v._id);
