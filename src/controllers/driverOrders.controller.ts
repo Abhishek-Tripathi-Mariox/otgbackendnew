@@ -1,6 +1,7 @@
 import { Response, NextFunction } from "express";
 import mongoose from "mongoose";
 import Booking, { pushStatus } from "../models/Booking.model";
+import Driver from "../models/Driver.model";
 import { AppError } from "../middlewares/errorHandler";
 import { DriverRequest } from "../middlewares/driverAuth.middleware";
 
@@ -155,6 +156,18 @@ export const updateOrderStatus = async (
       );
     }
 
+    // A driver must be online to make forward progress on a delivery
+    // (accept / pickup / mark delivered). Rejecting is allowed while offline.
+    if (action !== "reject") {
+      const driver = await Driver.findById(driverId).select("isOnline");
+      if (!driver?.isOnline) {
+        throw new AppError(
+          "You are offline. Go online to update the delivery status.",
+          400,
+        );
+      }
+    }
+
     const booking = await Booking.findOne({
       bookingId,
       driver: new mongoose.Types.ObjectId(driverId),
@@ -217,6 +230,33 @@ export const updateOrderStatus = async (
   }
 };
 
+// PATCH /api/mobile/driver/online  { isOnline: boolean }
+// Persists the driver's online/offline duty state.
+export const setOnlineStatus = async (
+  req: DriverRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const driverId = req.driver!.id;
+    const { isOnline } = req.body as { isOnline?: boolean };
+    if (typeof isOnline !== "boolean") {
+      throw new AppError("isOnline (boolean) is required.", 400);
+    }
+
+    const driver = await Driver.findById(driverId).select("isOnline lastOnlineAt");
+    if (!driver) throw new AppError("Driver not found", 404);
+
+    driver.isOnline = isOnline;
+    if (isOnline) driver.lastOnlineAt = new Date();
+    await driver.save({ validateModifiedOnly: true });
+
+    res.json({ success: true, data: { isOnline: driver.isOnline } });
+  } catch (error) {
+    next(error);
+  }
+};
+
 // GET /api/mobile/driver/dashboard
 // Returns counts + earnings used by the home screen.
 export const getDashboard = async (
@@ -229,6 +269,8 @@ export const getDashboard = async (
     const today = startOfDay();
     const weekStart = startOfWeek();
     const monthStart = startOfMonth();
+
+    const driverDoc = await Driver.findById(driverId).select("isOnline");
 
     // Combined count + earnings for delivered bookings since a given date.
     const periodAgg = (since: Date) =>
@@ -357,6 +399,7 @@ export const getDashboard = async (
         },
         newOffer: newOffer ? formatBooking(newOffer) : null,
         activeOrder: activeOrder ? formatBooking(activeOrder) : null,
+        isOnline: driverDoc?.isOnline ?? false,
       },
     });
   } catch (error) {

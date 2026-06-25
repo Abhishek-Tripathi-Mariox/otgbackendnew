@@ -187,7 +187,7 @@ export const updateBooking = async (
     if (site !== undefined) booking.site = site;
     booking.updatedBy = req.admin?._id as any;
 
-    await booking.save();
+    await booking.save({ validateModifiedOnly: true });
 
     const populatedBooking = await Booking.findById(booking._id)
       .populate("user", "name mobile email")
@@ -244,7 +244,7 @@ export const updateBookingStatus = async (
     }
 
     booking.updatedBy = req.admin?._id as any;
-    await booking.save();
+    await booking.save({ validateModifiedOnly: true });
 
     const populatedBooking = await Booking.findById(booking._id)
       .populate("user", "name mobile email")
@@ -292,7 +292,7 @@ export const allocateVendor = async (
     }
 
     booking.updatedBy = req.admin?._id as any;
-    await booking.save();
+    await booking.save({ validateModifiedOnly: true });
 
     const populated = await Booking.findById(booking._id)
       .populate("user", "name mobile email")
@@ -368,7 +368,7 @@ export const allocateDriver = async (
     }
 
     booking.updatedBy = req.admin?._id as any;
-    await booking.save();
+    await booking.save({ validateModifiedOnly: true });
 
     const populated = await Booking.findById(booking._id)
       .populate("user", "name mobile email")
@@ -407,7 +407,7 @@ export const deleteBooking = async (
     booking.deletedAt = new Date();
     booking.deletedBy = req.admin?._id as any;
 
-    await booking.save();
+    await booking.save({ validateModifiedOnly: true });
 
     res.json({
       success: true,

@@ -115,6 +115,11 @@ export interface IDriverModel extends Document {
   status: "active" | "inactive" | "blocked";
   isVerified: boolean;
 
+  // Driver's duty state. Only an online driver can act on a delivery
+  // (pickup / mark delivered). Toggled from the driver app home screen.
+  isOnline: boolean;
+  lastOnlineAt?: Date;
+
   deviceInfo?: {
     deviceId?: string;
     deviceType?: string;
@@ -241,6 +246,9 @@ const DriverSchema: Schema = new Schema(
       default: "active",
     },
     isVerified: { type: Boolean, default: false },
+
+    isOnline: { type: Boolean, default: false },
+    lastOnlineAt: { type: Date, default: null },
 
     deviceInfo: {
       deviceId: { type: String, trim: true },

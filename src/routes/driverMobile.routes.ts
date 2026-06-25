@@ -24,6 +24,7 @@ import {
   getMyOrder,
   updateOrderStatus,
   getDashboard,
+  setOnlineStatus,
 } from "../controllers/driverOrders.controller";
 import {
   listDriverNotifications,
@@ -112,6 +113,7 @@ router.delete(
 
 // Orders + dashboard
 router.get("/dashboard", authenticateDriver, getDashboard);
+router.patch("/online", authenticateDriver, setOnlineStatus);
 router.get("/orders", authenticateDriver, getMyOrders);
 router.get("/orders/:bookingId", authenticateDriver, getMyOrder);
 router.patch(
