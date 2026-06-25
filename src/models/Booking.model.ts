@@ -62,6 +62,7 @@ export interface IBookingDocument extends Document {
   price: number;
   totalAmount: number;
   site?: string;
+  pincode?: string;
   status: BookingStatus;
   paymentStatus: "pending" | "partial" | "completed";
   paymentMethod?: string;
@@ -141,6 +142,13 @@ const BookingSchema: Schema = new Schema(
     site: {
       type: String,
       trim: true,
+    },
+    // Delivery pincode — used to match unassigned orders to vendors whose
+    // business pincode is the same (claim/first-come-first-serve allocation).
+    pincode: {
+      type: String,
+      trim: true,
+      index: true,
     },
     status: {
       type: String,

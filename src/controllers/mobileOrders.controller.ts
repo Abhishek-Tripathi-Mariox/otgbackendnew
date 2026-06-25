@@ -3,6 +3,8 @@ import jwt from "jsonwebtoken";
 import Booking from "../models/Booking.model";
 import Material from "../models/Material.model";
 import User from "../models/User.model";
+import Vendor from "../models/Vendor.model";
+import Notification from "../models/Notification.model";
 import { AppError } from "../middlewares/errorHandler";
 import { UserRequest } from "../middlewares/userAuth.middleware";
 import {
@@ -11,7 +13,6 @@ import {
   resolveCart,
 } from "../services/offerEngine";
 import { recordOfferRedemption } from "./mobileOffers.controller";
-import { findNearestVendorForMaterial } from "../utils/vendorAllocation";
 
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
 
@@ -124,12 +125,20 @@ export const createOrderFromCart = async (
     const userId = req.user?.id;
     if (!userId) throw new AppError("Unauthorized", 401);
 
-    const { items, paymentMethod, site, notes, couponCode } = req.body as {
+    const {
+      items,
+      paymentMethod,
+      site,
+      notes,
+      couponCode,
+      pincode: bodyPincode,
+    } = req.body as {
       items?: CheckoutItem[];
       paymentMethod?: string;
       site?: string;
       notes?: string;
       couponCode?: string;
+      pincode?: string;
     };
 
     // Optional per-line GST sent by the customer app. Supports two shapes:
@@ -202,15 +211,17 @@ export const createOrderFromCart = async (
     }>;
     const grossTotal = lines.reduce((s, l) => s + l.gross, 0) || 1;
 
-    // Resolve customer coordinates once, so each line can attempt
-    // auto-allocation to the nearest stocking vendor in range.
+    // Resolve the delivery pincode. Vendors whose business pincode equals this
+    // will see the (unassigned) order and the first to accept claims it.
     const userDoc = await User.findById(userId)
-      .select("address.location.coordinates")
+      .select("address.pincode")
       .lean();
-    const customerCoords =
-      (userDoc?.address?.location?.coordinates as
-        | [number, number]
-        | undefined) || null;
+    const sitePincodeMatch = String(site || "").match(/\b(\d{6})\b/);
+    const deliveryPincode =
+      (typeof bodyPincode === "string" && bodyPincode.trim()) ||
+      (sitePincodeMatch ? sitePincodeMatch[1] : "") ||
+      userDoc?.address?.pincode ||
+      "";
 
     const created = [] as any[];
     let discountAllocated = 0;
@@ -245,17 +256,14 @@ export const createOrderFromCart = async (
 
       const bookingId = await generateBookingId();
 
-      // Auto-allocate to nearest stocking vendor within radius
-      const autoVendor = await findNearestVendorForMaterial(
-        line.material._id,
-        customerCoords,
-      );
-
+      // No auto-assignment: the order is created unassigned and offered to all
+      // vendors whose business pincode matches the delivery pincode. The first
+      // vendor to accept claims it (see vendorOrders.updateOrderStatus).
       const booking = await Booking.create({
         bookingId,
         user: userId,
         material: line.material._id,
-        vendor: autoVendor || undefined,
+        vendor: undefined,
         quantity: line.quantity,
         unit: line.material.unit,
         price: line.price,
@@ -263,6 +271,7 @@ export const createOrderFromCart = async (
         gstAmount,
         discountAmount: +lineDiscount.toFixed(2),
         site,
+        pincode: deliveryPincode || undefined,
         notes,
         paymentMethod,
         createdBy: userId,
@@ -277,6 +286,34 @@ export const createOrderFromCart = async (
 
     if (created.length === 0) {
       throw new AppError("Could not create any orders from the cart.", 400);
+    }
+
+    // Notify every active vendor whose business pincode matches the delivery
+    // pincode that new claimable order(s) are available. First to accept wins.
+    if (deliveryPincode) {
+      const matchingVendors = await Vendor.find({
+        "business.pincode": deliveryPincode,
+        status: "active",
+        isDeleted: false,
+      })
+        .select("_id")
+        .lean();
+
+      if (matchingVendors.length > 0) {
+        const vendorIds = matchingVendors.map(v => v._id);
+        await Notification.create({
+          title: "New order available",
+          message: `A new order is available in your area (pincode ${deliveryPincode}). Accept it before another vendor does.`,
+          targetType: "specific",
+          specificRecipients: { users: [], vendors: vendorIds, drivers: [] },
+          sentTo: { userCount: 0, vendorCount: vendorIds.length, driverCount: 0 },
+          status: "sent",
+          sentAt: new Date(),
+          // System-generated; stamp the customer as the initiator to satisfy
+          // the required createdBy (no admin involved in this flow).
+          createdBy: userId,
+        });
+      }
     }
 
     // Record redemption (one per checkout, not per booking)

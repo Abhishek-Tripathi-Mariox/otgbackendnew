@@ -152,20 +152,44 @@ export const listMyOrders = async (
     const vendorId = req.vendor!.id;
     const statusParam = (req.query.status as string) || "All Orders";
 
-    const filter: any = {
+    // Orders already assigned to this vendor (optionally filtered by status).
+    const assigned: any = {
       vendor: new mongoose.Types.ObjectId(vendorId),
       isDeleted: false,
     };
 
+    let rawList: string[] | null = null;
     if (statusParam && statusParam !== "All Orders") {
-      const rawList = UI_TO_RAW[statusParam as UiStatus];
-      if (rawList && rawList.length) {
-        filter.status = { $in: rawList };
+      const list = UI_TO_RAW[statusParam as UiStatus];
+      if (list && list.length) {
+        rawList = list;
+        assigned.status = { $in: list };
+      }
+    }
+
+    const orConds: any[] = [assigned];
+
+    // Unassigned "claimable" orders whose delivery pincode matches this
+    // vendor's business pincode. Shown under "All Orders" or the Pending tab.
+    const showClaimable =
+      statusParam === "All Orders" || (rawList?.includes("pending") ?? false);
+    if (showClaimable) {
+      const vendorDoc = await Vendor.findById(vendorId)
+        .select("business.pincode")
+        .lean();
+      const vendorPincode = vendorDoc?.business?.pincode;
+      if (vendorPincode) {
+        orConds.push({
+          vendor: null,
+          isDeleted: false,
+          status: "pending",
+          pincode: vendorPincode,
+        });
       }
     }
 
     const bookings = await populateBooking(
-      Booking.find(filter).sort({ createdAt: -1 }).limit(100),
+      Booking.find({ $or: orConds }).sort({ createdAt: -1 }).limit(100),
     );
 
     res.json({
@@ -190,15 +214,26 @@ export const getMyOrder = async (
     const vendorId = req.vendor!.id;
     const raw = String(req.params.id || "").trim();
     const isObjectId = /^[a-fA-F0-9]{24}$/.test(raw);
-    const orQuery: any[] = isObjectId
+    const idQuery: any[] = isObjectId
       ? [{ _id: raw }, { bookingId: raw.toUpperCase() }]
       : [{ bookingId: raw.toUpperCase() }];
 
+    const vendorDoc = await Vendor.findById(vendorId)
+      .select("business.pincode")
+      .lean();
+    const vendorPincode = vendorDoc?.business?.pincode;
+
+    // Visible if assigned to this vendor OR a claimable (unassigned, pending,
+    // matching-pincode) order.
+    const ownership: any[] = [{ vendor: new mongoose.Types.ObjectId(vendorId) }];
+    if (vendorPincode) {
+      ownership.push({ vendor: null, status: "pending", pincode: vendorPincode });
+    }
+
     const booking = await populateBooking(
       Booking.findOne({
-        vendor: new mongoose.Types.ObjectId(vendorId),
         isDeleted: false,
-        $or: orQuery,
+        $and: [{ $or: idQuery }, { $or: ownership }],
       }),
     );
 
@@ -234,24 +269,59 @@ export const updateOrderStatus = async (
     }
 
     const isObjectId = /^[a-fA-F0-9]{24}$/.test(raw);
-    const orQuery: any[] = isObjectId
+    const idQuery: any[] = isObjectId
       ? [{ _id: raw }, { bookingId: raw.toUpperCase() }]
       : [{ bookingId: raw.toUpperCase() }];
 
-    const booking = await Booking.findOne({
-      vendor: new mongoose.Types.ObjectId(vendorId),
-      isDeleted: false,
-      $or: orQuery,
-    });
+    const vendorObjId = new mongoose.Types.ObjectId(vendorId);
 
+    // Find the order regardless of assignment so we can either act on our own
+    // order or claim an unassigned one.
+    const booking = await Booking.findOne({ isDeleted: false, $or: idQuery });
     if (!booking) throw new AppError("Order not found", 404);
 
+    const isAssignedToMe =
+      booking.vendor && String(booking.vendor) === String(vendorId);
+    const isClaimable = !booking.vendor && booking.status === "pending";
+
     if (action === "accept") {
+      if (isClaimable) {
+        // First-come-first-serve: atomically claim only if still unassigned.
+        // Whoever wins the race gets vendor set; everyone else gets null back.
+        const now = new Date();
+        const claimed = await Booking.findOneAndUpdate(
+          { _id: booking._id, vendor: null, status: "pending" },
+          {
+            $set: { vendor: vendorObjId, status: "accepted" },
+            $push: { statusHistory: { status: "accepted", at: now } },
+          },
+          { new: true },
+        );
+        if (!claimed) {
+          throw new AppError(
+            "This order was already taken by another vendor.",
+            409,
+          );
+        }
+        const populated = await populateBooking(
+          Booking.findById(claimed._id),
+        );
+        res.json({ success: true, data: formatBooking(populated) });
+        return;
+      }
+      if (!isAssignedToMe) {
+        throw new AppError("This order is not available to you.", 403);
+      }
       if (booking.status !== "pending") {
         throw new AppError("Only pending orders can be accepted.", 400);
       }
       pushStatus(booking, "accepted");
     } else if (action === "reject") {
+      // A vendor can only reject an order already assigned to them. Unclaimed
+      // orders are simply ignored (another vendor may still take them).
+      if (!isAssignedToMe) {
+        throw new AppError("This order is not assigned to you.", 403);
+      }
       if (!["pending", "accepted", "confirmed"].includes(booking.status)) {
         throw new AppError("This order can no longer be rejected.", 400);
       }
@@ -261,7 +331,7 @@ export const updateOrderStatus = async (
       }
     }
 
-    await booking.save();
+    await booking.save({ validateModifiedOnly: true });
     const populated = await populateBooking(Booking.findById(booking._id));
     res.json({ success: true, data: formatBooking(populated) });
   } catch (error) {
