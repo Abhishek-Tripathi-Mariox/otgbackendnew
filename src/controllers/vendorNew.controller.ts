@@ -399,7 +399,7 @@ export const deleteVendor = async (
     vendor.isDeleted = true;
     vendor.deletedAt = new Date();
     vendor.deletedBy = new mongoose.Types.ObjectId(req.admin!._id);
-    await vendor.save();
+    await vendor.save({ validateModifiedOnly: true });
 
     res.json({
       success: true,
@@ -432,7 +432,7 @@ export const restoreVendor = async (
     vendor.deletedAt = undefined;
     vendor.deletedBy = undefined;
     vendor.updatedBy = new mongoose.Types.ObjectId(req.admin!._id);
-    await vendor.save();
+    await vendor.save({ validateModifiedOnly: true });
 
     const restoredVendor = await Vendor.findById(id)
       .populate("createdBy", "name email")
@@ -497,7 +497,7 @@ export const toggleVendorStatus = async (
 
     vendor.status = vendor.status === "active" ? "inactive" : "active";
     vendor.updatedBy = new mongoose.Types.ObjectId(req.admin!._id);
-    await vendor.save();
+    await vendor.save({ validateModifiedOnly: true });
 
     const updatedVendor = await Vendor.findById(id)
       .populate("createdBy", "name email")
@@ -677,7 +677,7 @@ export const updateVendorMaterial = async (
     if (specs !== undefined) vendorMaterial.specs = specs;
 
     vendorMaterial.updatedBy = new mongoose.Types.ObjectId(req.admin!._id);
-    await vendorMaterial.save();
+    await vendorMaterial.save({ validateModifiedOnly: true });
 
     const updatedMaterial = await VendorMaterial.findById(vendorMaterial._id)
       .populate({
@@ -747,7 +747,7 @@ export const toggleVendorMaterialAvailability = async (
 
     vendorMaterial.isAvailable = !vendorMaterial.isAvailable;
     vendorMaterial.updatedBy = new mongoose.Types.ObjectId(req.admin!._id);
-    await vendorMaterial.save();
+    await vendorMaterial.save({ validateModifiedOnly: true });
 
     const updatedMaterial = await VendorMaterial.findById(vendorMaterial._id)
       .populate({
