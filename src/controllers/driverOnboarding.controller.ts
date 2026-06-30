@@ -256,7 +256,7 @@ export const savePersonal = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const { name, email, dateOfBirth, address } = req.body;
+    const { name, email, dateOfBirth, address, pincode } = req.body;
     const driver = await loadDriver(req);
 
     if (name !== undefined) driver.name = name;
@@ -271,6 +271,13 @@ export const savePersonal = async (
       driver.dateOfBirth = dateOfBirth
         ? parseDate(dateOfBirth, "Date of birth")
         : undefined;
+    }
+
+    // Pincode is used to match the driver to vendors in the same area
+    // (a vendor only sees drivers whose pincode matches theirs).
+    if (pincode !== undefined) {
+      if (!driver.address) driver.address = {};
+      driver.address.pincode = String(pincode).trim() || undefined;
     }
 
     if (address !== undefined) {
