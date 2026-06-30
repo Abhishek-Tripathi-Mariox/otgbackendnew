@@ -69,6 +69,7 @@ export const getBookings = async (
       Booking.find(query)
         .populate("user", "name mobile email")
         .populate("vendor", "name mobile email")
+        .populate("driver", "name mobile vehicles")
         .populate("material", "name image unit")
         .sort({ createdAt: -1 })
         .skip(skip)
@@ -103,6 +104,7 @@ export const getBooking = async (
     const booking = await Booking.findById(id)
       .populate("user", "name mobile email address")
       .populate("vendor", "name mobile email")
+      .populate("driver", "name mobile vehicles")
       .populate("material", "name image unit description");
 
     if (!booking) {
