@@ -411,6 +411,11 @@ export const submitDocumentsStep = async (
       vendor.onboardingStep,
       "documents",
     );
+    // A self-registered vendor that just finished onboarding awaits admin
+    // approval. Don't downgrade one an admin already approved.
+    if (vendor.approvalStatus !== "approved") {
+      vendor.approvalStatus = "pending";
+    }
     await vendor.save();
     res.json(onboardingResponse(vendor));
   } catch (error) {

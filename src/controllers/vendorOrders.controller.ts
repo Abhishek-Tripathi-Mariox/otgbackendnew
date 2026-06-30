@@ -11,8 +11,13 @@ import {
 } from "../utils/vendorAllocation";
 import { uploadBufferToS3 } from "../config/s3";
 
-const ALLOWED_QC_MIME = ["image/jpeg", "image/png", "image/webp"];
-const MAX_QC_BYTES = 7 * 1024 * 1024;
+const ALLOWED_QC_MIME = [
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "application/pdf",
+];
+const MAX_QC_BYTES = 10 * 1024 * 1024;
 
 type UiStatus =
   | "Pending"
@@ -608,7 +613,7 @@ export const uploadVendorImage = async (
     const mime = match[1];
     const payload = match[2];
     if (!ALLOWED_QC_MIME.includes(mime)) {
-      throw new AppError("Only JPG, PNG or WebP images are allowed.", 400);
+      throw new AppError("Only JPG, PNG, WebP images or PDF are allowed.", 400);
     }
     const buffer = Buffer.from(payload, "base64");
     if (buffer.length === 0) throw new AppError("Empty file payload", 400);
