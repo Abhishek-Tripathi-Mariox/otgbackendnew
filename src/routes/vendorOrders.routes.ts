@@ -10,6 +10,7 @@ import {
   packOrder,
   dispatchOrder,
   getAssignableDrivers,
+  uploadVendorImage,
 } from "../controllers/vendorOrders.controller";
 import { authenticateVendor } from "../middlewares/vendorAuth.middleware";
 
@@ -17,6 +18,7 @@ const router = Router();
 
 router.use(authenticateVendor);
 
+router.post("/upload", uploadVendorImage);
 router.get("/", listMyOrders);
 router.get("/payments", listPayments);
 router.get("/summary/counts", getOrderCounts);

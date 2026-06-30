@@ -67,7 +67,7 @@ export const upload = multer({
   storage: createS3Storage("categories"),
   fileFilter: fileFilter,
   limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB limit
+    fileSize: 10 * 1024 * 1024, // 10MB limit (was 5MB — larger logos failed)
   },
 });
 

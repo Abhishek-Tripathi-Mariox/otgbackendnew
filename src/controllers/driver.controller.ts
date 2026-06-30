@@ -218,7 +218,7 @@ export const updateDriver = async (
     }
 
     driver.updatedBy = new mongoose.Types.ObjectId(req.admin!._id);
-    await driver.save();
+    await driver.save({ validateModifiedOnly: true });
 
     const updated = await Driver.findById(id)
       .populate("updatedBy", "name email")
@@ -249,7 +249,7 @@ export const deleteDriver = async (
     driver.isDeleted = true;
     driver.deletedAt = new Date();
     driver.deletedBy = new mongoose.Types.ObjectId(req.admin!._id);
-    await driver.save();
+    await driver.save({ validateModifiedOnly: true });
 
     res.json({ success: true, message: "Driver deleted successfully" });
   } catch (error) {
@@ -273,7 +273,7 @@ export const restoreDriver = async (
     driver.deletedAt = undefined;
     driver.deletedBy = undefined;
     driver.updatedBy = new mongoose.Types.ObjectId(req.admin!._id);
-    await driver.save();
+    await driver.save({ validateModifiedOnly: true });
 
     const restored = await Driver.findById(id).populate(
       "updatedBy",
@@ -331,7 +331,7 @@ export const toggleDriverStatus = async (
     }
 
     driver.updatedBy = new mongoose.Types.ObjectId(req.admin!._id);
-    await driver.save();
+    await driver.save({ validateModifiedOnly: true });
 
     const updated = await Driver.findById(id).populate(
       "updatedBy",
@@ -387,7 +387,7 @@ export const approveDriver = async (
     });
 
     driver.updatedBy = new mongoose.Types.ObjectId(req.admin!._id);
-    await driver.save();
+    await driver.save({ validateModifiedOnly: true });
 
     const updated = await Driver.findById(id)
       .populate("updatedBy", "name email")
@@ -423,7 +423,7 @@ export const rejectDriver = async (
     driver.approvedAt = undefined;
     driver.approvedBy = undefined;
     driver.updatedBy = new mongoose.Types.ObjectId(req.admin!._id);
-    await driver.save();
+    await driver.save({ validateModifiedOnly: true });
 
     const updated = await Driver.findById(id).populate(
       "updatedBy",
@@ -470,7 +470,7 @@ export const rejectDocument = async (
     doc.rejectionReason = reason || "Document rejected. Please re-upload.";
 
     driver.updatedBy = new mongoose.Types.ObjectId(req.admin!._id);
-    await driver.save();
+    await driver.save({ validateModifiedOnly: true });
 
     const updated = await Driver.findById(id).populate(
       "updatedBy",
@@ -516,7 +516,7 @@ export const approveDocument = async (
     doc.rejectionReason = undefined;
 
     driver.updatedBy = new mongoose.Types.ObjectId(req.admin!._id);
-    await driver.save();
+    await driver.save({ validateModifiedOnly: true });
 
     const updated = await Driver.findById(id).populate(
       "updatedBy",
@@ -570,7 +570,7 @@ const updateVehicleDocStatus = async (
         : undefined;
 
     driver.updatedBy = new mongoose.Types.ObjectId(req.admin!._id);
-    await driver.save();
+    await driver.save({ validateModifiedOnly: true });
 
     const updated = await Driver.findById(id).populate(
       "updatedBy",

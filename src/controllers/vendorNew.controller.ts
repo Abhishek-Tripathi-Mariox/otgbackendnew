@@ -513,6 +513,88 @@ export const toggleVendorStatus = async (
   }
 };
 
+// Approve a self-registered vendor (admin reviews uploaded documents).
+export const approveVendor = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { id } = req.params;
+
+    const vendor = await Vendor.findById(id);
+    if (!vendor) throw new AppError("Vendor not found", 404);
+    if (vendor.isDeleted) {
+      throw new AppError("Cannot approve a deleted vendor", 400);
+    }
+
+    vendor.approvalStatus = "approved";
+    vendor.status = "active";
+    vendor.isVerified = true;
+    vendor.rejectionReason = undefined;
+    vendor.approvedBy = new mongoose.Types.ObjectId(req.admin!._id);
+    vendor.approvedAt = new Date();
+    if (!vendor.createdBy) {
+      vendor.createdBy = new mongoose.Types.ObjectId(req.admin!._id);
+    }
+    vendor.updatedBy = new mongoose.Types.ObjectId(req.admin!._id);
+    await vendor.save({ validateModifiedOnly: true });
+
+    const updatedVendor = await Vendor.findById(id)
+      .populate("createdBy", "name email")
+      .populate("approvedBy", "name email");
+
+    res.json({
+      success: true,
+      message: "Vendor approved successfully",
+      data: updatedVendor,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Reject a self-registered vendor (with an optional reason).
+export const rejectVendor = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body as { reason?: string };
+
+    const vendor = await Vendor.findById(id);
+    if (!vendor) throw new AppError("Vendor not found", 404);
+    if (vendor.isDeleted) {
+      throw new AppError("Cannot reject a deleted vendor", 400);
+    }
+
+    // Keep status active & isVerified as-is so the vendor can still log in to
+    // see the reason and re-apply. Order access is gated by approvalStatus.
+    vendor.approvalStatus = "rejected";
+    vendor.rejectionReason = reason || "Application rejected by admin.";
+    if (!vendor.createdBy) {
+      vendor.createdBy = new mongoose.Types.ObjectId(req.admin!._id);
+    }
+    vendor.updatedBy = new mongoose.Types.ObjectId(req.admin!._id);
+    await vendor.save({ validateModifiedOnly: true });
+
+    const updatedVendor = await Vendor.findById(id).populate(
+      "createdBy",
+      "name email",
+    );
+
+    res.json({
+      success: true,
+      message: "Vendor rejected",
+      data: updatedVendor,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 // ==================== VENDOR MATERIALS ====================
 
 // Get materials for a vendor

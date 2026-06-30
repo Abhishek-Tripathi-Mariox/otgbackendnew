@@ -9,6 +9,10 @@ import {
   findAssignableDrivers,
   findFirstAvailableDriver,
 } from "../utils/vendorAllocation";
+import { uploadBufferToS3 } from "../config/s3";
+
+const ALLOWED_QC_MIME = ["image/jpeg", "image/png", "image/webp"];
+const MAX_QC_BYTES = 7 * 1024 * 1024;
 
 type UiStatus =
   | "Pending"
@@ -176,12 +180,13 @@ export const listMyOrders = async (
     let claimablePincode = "";
     if (showClaimable) {
       const vendorDoc = await Vendor.findById(vendorId)
-        .select("business.pincode")
+        .select("business.pincode approvalStatus")
         .lean();
       const vendorPincode = (
         String(vendorDoc?.business?.pincode ?? "").match(/\d{6}/) || []
       )[0];
-      if (vendorPincode) {
+      // Only approved vendors are offered claimable orders.
+      if (vendorPincode && vendorDoc?.approvalStatus === "approved") {
         claimablePincode = vendorPincode;
         orConds.push({
           vendor: null,
@@ -582,6 +587,42 @@ export const getOrderInvoice = async (
  * URL/strings (already-uploaded URLs) — there is NO multipart handling here.
  * Allowed from: accepted | confirmed (legacy) | qc_pending.
  */
+/**
+ * POST /api/vendor/orders/upload  body: { file: "data:image/...;base64,..." }
+ * Uploads a single QC image to S3 and returns its URL. The vendor app calls
+ * this per picked photo, then sends the URLs to submitQC.
+ */
+export const uploadVendorImage = async (
+  req: VendorRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { file } = req.body as { file?: string };
+    if (!file || typeof file !== "string" || !file.startsWith("data:")) {
+      throw new AppError("file (base64 data URI) is required", 400);
+    }
+    const match = file.match(/^data:([a-zA-Z0-9.+/-]+);base64,(.+)$/);
+    if (!match) throw new AppError("Invalid base64 file payload", 400);
+
+    const mime = match[1];
+    const payload = match[2];
+    if (!ALLOWED_QC_MIME.includes(mime)) {
+      throw new AppError("Only JPG, PNG or WebP images are allowed.", 400);
+    }
+    const buffer = Buffer.from(payload, "base64");
+    if (buffer.length === 0) throw new AppError("Empty file payload", 400);
+    if (buffer.length > MAX_QC_BYTES) {
+      throw new AppError("Image must be 7 MB or smaller.", 400);
+    }
+
+    const url = await uploadBufferToS3(buffer, "vendor/qc", mime);
+    res.json({ success: true, data: { url } });
+  } catch (error) {
+    next(error);
+  }
+};
+
 export const submitQC = async (
   req: VendorRequest,
   res: Response,
@@ -611,9 +652,12 @@ export const submitQC = async (
       packagingPhotos: Array.isArray(packagingPhotos) ? packagingPhotos : [],
       note: note || undefined,
     };
-    pushStatus(booking, "qc_approved", note);
+    // QC photos are submitted for ADMIN review — the order waits at
+    // `qc_pending` until an admin approves it (then it becomes `qc_approved`
+    // and the vendor can pack). It is NOT auto-approved here.
+    pushStatus(booking, "qc_pending", note);
 
-    await booking.save();
+    await booking.save({ validateModifiedOnly: true });
     const populated = await populateBooking(Booking.findById(booking._id));
     res.json({ success: true, data: formatBooking(populated) });
   } catch (error) {
@@ -637,16 +681,16 @@ export const packOrder = async (
     const booking = await findVendorBooking(vendorId, req.params.id);
     if (!booking) throw new AppError("Order not found", 404);
 
-    if (!["qc_approved", "qc_pending"].includes(booking.status)) {
+    if (booking.status !== "qc_approved") {
       throw new AppError(
-        "Only QC-approved orders can be packed.",
+        "QC must be approved by admin before packing.",
         400,
       );
     }
 
     pushStatus(booking, "packed", note);
 
-    await booking.save();
+    await booking.save({ validateModifiedOnly: true });
     const populated = await populateBooking(Booking.findById(booking._id));
     res.json({ success: true, data: formatBooking(populated) });
   } catch (error) {
@@ -742,12 +786,16 @@ export const dispatchOrder = async (
  * Shape: [{ id, name, vehicleNumber }]
  */
 export const getAssignableDrivers = async (
-  _req: VendorRequest,
+  req: VendorRequest,
   res: Response,
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const drivers = await findAssignableDrivers();
+    // Only show drivers whose registered pincode matches this vendor's pincode.
+    const vendorDoc = await Vendor.findById(req.vendor!.id)
+      .select("business.pincode")
+      .lean();
+    const drivers = await findAssignableDrivers(vendorDoc?.business?.pincode);
     res.json({
       success: true,
       data: drivers.map(d => ({

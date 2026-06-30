@@ -321,14 +321,25 @@ export const allocateDriver = async (
 ): Promise<void> => {
   try {
     const { id } = req.params;
-    const { driverId, vehicleNumber: pickedVehicle } = req.body as {
+    const {
+      driverId,
+      vehicleNumber: pickedVehicle,
+      vehicleType,
+    } = req.body as {
       driverId?: string | null;
       vehicleNumber?: string | null;
+      vehicleType?: string | null;
     };
 
     const booking = await Booking.findOne({ _id: id, isDeleted: false });
     if (!booking) {
       throw new AppError("Booking not found.", 404);
+    }
+
+    // Vehicle type (2/3/4/6-wheeler) is admin's shipping choice — set it
+    // independently of driver assignment when provided.
+    if (vehicleType !== undefined) {
+      booking.vehicleType = (vehicleType || undefined) as any;
     }
 
     if (driverId) {

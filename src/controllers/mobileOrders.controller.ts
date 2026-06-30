@@ -301,6 +301,7 @@ export const createOrderFromCart = async (
       const matchingVendors = await Vendor.find({
         "business.pincode": new RegExp(deliveryPincode),
         status: "active",
+        approvalStatus: "approved",
         isDeleted: false,
       })
         .select("_id")

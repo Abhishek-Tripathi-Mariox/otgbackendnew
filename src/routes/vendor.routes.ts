@@ -9,6 +9,8 @@ import {
   restoreVendor,
   permanentDeleteVendor,
   toggleVendorStatus,
+  approveVendor,
+  rejectVendor,
   getVendorMaterials,
   addVendorMaterial,
   updateVendorMaterial,
@@ -52,6 +54,10 @@ router.delete("/:id/permanent", permanentDeleteVendor);
 
 // Toggle vendor status
 router.patch("/:id/toggle-status", toggleVendorStatus);
+
+// Approve / reject a self-registered vendor
+router.patch("/:id/approve", approveVendor);
+router.patch("/:id/reject", rejectVendor);
 
 // ==================== VENDOR MATERIALS ====================
 

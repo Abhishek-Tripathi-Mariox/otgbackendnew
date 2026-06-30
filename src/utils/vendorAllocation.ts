@@ -63,19 +63,26 @@ export async function findNearestVendorForMaterial(
  * Drivers eligible for dispatch assignment: active, approved, not deleted.
  * Used both for the vendor's driver picker and for auto-assignment fallback.
  */
-export async function findAssignableDrivers(): Promise<
+export async function findAssignableDrivers(pincode?: string): Promise<
   Array<{
     _id: mongoose.Types.ObjectId;
     name?: string;
     vehicles?: Array<{ registrationNo?: string }>;
   }>
 > {
-  return Driver.find({
+  const query: any = {
     status: "active",
     approvalStatus: "approved",
     isDeleted: false,
-  })
-    .select("name vehicles.registrationNo")
+  };
+  // When a vendor's pincode is given, only show drivers registered in the same
+  // pincode (matched on the 6-digit code, ignoring spaces/format).
+  const pin = (String(pincode ?? "").match(/\d{6}/) || [])[0];
+  if (pin) {
+    query["address.pincode"] = new RegExp(pin);
+  }
+  return Driver.find(query)
+    .select("name vehicles.registrationNo address.pincode")
     .sort({ updatedAt: -1 })
     .lean();
 }

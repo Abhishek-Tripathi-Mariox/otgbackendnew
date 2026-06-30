@@ -70,6 +70,8 @@ export interface IBookingDocument extends Document {
   deliveryDate?: Date;
   qc?: IBookingQC;
   dispatch?: IBookingDispatch;
+  // Vehicle type chosen by admin for shipping this order.
+  vehicleType?: "2-wheeler" | "3-wheeler" | "4-wheeler" | "6-wheeler";
   gstAmount?: number;
   discountAmount?: number;
   statusHistory?: IBookingStatusHistory[];
@@ -184,6 +186,10 @@ const BookingSchema: Schema = new Schema(
       dispatchTime: { type: String, trim: true },
       vehicleNumber: { type: String, trim: true },
       driverName: { type: String, trim: true },
+    },
+    vehicleType: {
+      type: String,
+      enum: ["2-wheeler", "3-wheeler", "4-wheeler", "6-wheeler"],
     },
     gstAmount: {
       type: Number,

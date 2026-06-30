@@ -56,6 +56,9 @@ export const sendOTP = async (
         mobile,
         status: "active",
         isVerified: false,
+        // Self-registered vendors wait for admin approval before they can
+        // operate (receive/claim orders). They can still log in & onboard.
+        approvalStatus: "pending",
         addedByAdmin: false,
         onboardingStep: "business",
       });
@@ -408,6 +411,38 @@ export const submitDocumentsStep = async (
       vendor.onboardingStep,
       "documents",
     );
+    await vendor.save();
+    res.json(onboardingResponse(vendor));
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /api/vendor/auth/onboarding/reapply
+ * A rejected vendor re-submits (optionally with updated documents). Moves the
+ * application back to "pending" for the admin to review again.
+ */
+export const reapplyVendor = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const vendor = await loadOnboardingVendor(req);
+    const { documents } = req.body || {};
+    if (documents && typeof documents === "object") {
+      vendor.documents = {
+        gstCertificate:
+          documents.gstCertificate ?? vendor.documents?.gstCertificate,
+        panCard: documents.panCard ?? vendor.documents?.panCard,
+        tradeLicense: documents.tradeLicense ?? vendor.documents?.tradeLicense,
+        bankCheque: documents.bankCheque ?? vendor.documents?.bankCheque,
+      };
+    }
+    vendor.approvalStatus = "pending";
+    vendor.rejectionReason = undefined;
+    vendor.onboardingStep = "completed";
     await vendor.save();
     res.json(onboardingResponse(vendor));
   } catch (error) {

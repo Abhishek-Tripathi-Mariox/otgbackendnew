@@ -18,6 +18,7 @@ import {
   saveBusinessStep,
   saveCategoriesStep,
   submitDocumentsStep,
+  reapplyVendor,
 } from "../controllers/vendorAuth.controller";
 import { authenticateVendor } from "../middlewares/vendorAuth.middleware";
 
@@ -37,6 +38,7 @@ router.post("/logout", authenticateVendor, logout);
 router.post("/onboarding/business", authenticateVendor, saveBusinessStep);
 router.post("/onboarding/categories", authenticateVendor, saveCategoriesStep);
 router.post("/onboarding/documents", authenticateVendor, submitDocumentsStep);
+router.post("/onboarding/reapply", authenticateVendor, reapplyVendor);
 
 // Protected — notifications
 router.get("/notifications", authenticateVendor, listVendorNotifications);

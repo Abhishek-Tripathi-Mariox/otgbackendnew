@@ -67,6 +67,13 @@ export interface IVendorDocument extends Document {
   };
   status: "active" | "inactive";
   isVerified: boolean;
+  // Admin approval state for self-registered vendors. Admin-created vendors
+  // default to "approved"; vendors who sign up via the app are "pending" until
+  // an admin reviews their documents and approves/rejects.
+  approvalStatus: "pending" | "approved" | "rejected";
+  approvedBy?: mongoose.Types.ObjectId;
+  approvedAt?: Date;
+  rejectionReason?: string;
   addedByAdmin: boolean;
   otp?: string;
   otpExpiry?: Date;
@@ -223,6 +230,24 @@ const VendorSchema: Schema = new Schema(
     isVerified: {
       type: Boolean,
       default: false,
+    },
+    approvalStatus: {
+      type: String,
+      enum: ["pending", "approved", "rejected"],
+      default: "approved",
+    },
+    approvedBy: {
+      type: Schema.Types.ObjectId,
+      ref: "Admin",
+      default: null,
+    },
+    approvedAt: {
+      type: Date,
+      default: null,
+    },
+    rejectionReason: {
+      type: String,
+      trim: true,
     },
     addedByAdmin: {
       type: Boolean,
