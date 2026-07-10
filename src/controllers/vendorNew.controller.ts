@@ -4,6 +4,45 @@ import Vendor from "../models/Vendor.model";
 import VendorMaterial from "../models/VendorMaterial.model";
 import { AuthRequest } from "../types";
 import { AppError } from "../middlewares/errorHandler";
+import { uploadBufferToS3 } from "../config/s3";
+
+const ALLOWED_DOC_MIME = [
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "application/pdf",
+];
+
+// POST /api/vendors/upload-doc  body: { file: "data:...;base64,..." }
+// Admin uploads a vendor document (image/PDF) to S3 and gets back the URL,
+// which is then stored on the vendor via updateVendor.
+export const uploadVendorDoc = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { file } = req.body as { file?: string };
+    if (!file || typeof file !== "string" || !file.startsWith("data:")) {
+      throw new AppError("file (base64 data URI) is required", 400);
+    }
+    const match = file.match(/^data:([a-zA-Z0-9.+/-]+);base64,(.+)$/);
+    if (!match) throw new AppError("Invalid base64 file payload", 400);
+    const mime = match[1];
+    if (!ALLOWED_DOC_MIME.includes(mime)) {
+      throw new AppError("Only JPG, PNG, WebP images or PDF are allowed.", 400);
+    }
+    const buffer = Buffer.from(match[2], "base64");
+    if (buffer.length === 0) throw new AppError("Empty file payload", 400);
+    if (buffer.length > 10 * 1024 * 1024) {
+      throw new AppError("File must be 10 MB or smaller.", 400);
+    }
+    const url = await uploadBufferToS3(buffer, "vendor/documents", mime);
+    res.json({ success: true, data: { url } });
+  } catch (error) {
+    next(error);
+  }
+};
 
 // Get all vendors (with pagination and filters)
 export const getVendors = async (
@@ -264,8 +303,16 @@ export const updateVendor = async (
 ): Promise<void> => {
   try {
     const { id } = req.params;
-    const { name, mobile, email, business, location, status, bankDetails } =
-      req.body;
+    const {
+      name,
+      mobile,
+      email,
+      business,
+      location,
+      status,
+      bankDetails,
+      documents,
+    } = req.body;
 
     const vendor = await Vendor.findById(id);
     if (!vendor) {
@@ -347,6 +394,18 @@ export const updateVendor = async (
         branchName: bankDetails.branchName ?? vendor.bankDetails?.branchName,
       };
       vendor.markModified('bankDetails');
+    }
+
+    // Admin can attach/replace vendor documents (GST/PAN/Trade/Bank) directly.
+    if (documents && typeof documents === "object") {
+      vendor.documents = {
+        gstCertificate:
+          documents.gstCertificate ?? vendor.documents?.gstCertificate,
+        panCard: documents.panCard ?? vendor.documents?.panCard,
+        tradeLicense: documents.tradeLicense ?? vendor.documents?.tradeLicense,
+        bankCheque: documents.bankCheque ?? vendor.documents?.bankCheque,
+      };
+      vendor.markModified("documents");
     }
 
     // Ensure business subdocument changes are persisted

@@ -1,4 +1,5 @@
-import { Response, NextFunction } from "express";
+import { Request, Response, NextFunction } from "express";
+import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
 import Booking, { pushStatus } from "../models/Booking.model";
 import Vendor from "../models/Vendor.model";
@@ -10,6 +11,9 @@ import {
   findFirstAvailableDriver,
 } from "../utils/vendorAllocation";
 import { uploadBufferToS3 } from "../config/s3";
+import { buildTaxInvoiceHtml } from "../utils/taxInvoiceHtml";
+
+const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
 
 const ALLOWED_QC_MIME = [
   "image/jpeg",
@@ -757,6 +761,17 @@ export const dispatchOrder = async (
       booking.driver = driver._id as mongoose.Types.ObjectId;
       driverName = driver.name;
       assignedVehicle = driver.vehicles?.[0]?.registrationNo;
+    } else if (booking.driver) {
+      // A driver already early-claimed this order (right after the vendor
+      // accepted it, matched by pincode) — keep them rather than picking a
+      // different one.
+      const existing = await Driver.findById(booking.driver)
+        .select("name vehicles.registrationNo")
+        .lean();
+      if (existing) {
+        driverName = existing.name;
+        assignedVehicle = existing.vehicles?.[0]?.registrationNo;
+      }
     } else {
       const driver = await findFirstAvailableDriver();
       if (driver) {
@@ -809,6 +824,114 @@ export const getAssignableDrivers = async (
         vehicleNumber: d.vehicles?.[0]?.registrationNo || null,
       })),
     });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ---------------- Printable vendor tax-invoice (GST format) ----------------
+
+// GET /api/vendor/orders/:id/invoice/html?token=...
+// Printable GST tax invoice (vendor -> customer). Authenticated via the token
+// query param so it can be opened directly in the browser for print/save-as-PDF.
+export const getVendorInvoiceHtml = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const headerToken = req.headers.authorization?.startsWith("Bearer ")
+      ? req.headers.authorization.split(" ")[1]
+      : undefined;
+    const token = (req.query.token as string) || headerToken;
+    if (!token) throw new AppError("No token provided", 401);
+
+    let vendorId: string;
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET) as {
+        id: string;
+        type: string;
+      };
+      if (decoded.type !== "vendor") throw new AppError("Invalid token", 401);
+      vendorId = decoded.id;
+    } catch {
+      throw new AppError("Invalid or expired token", 401);
+    }
+
+    const raw = String(req.params.id || "").trim();
+    const isObjectId = /^[a-fA-F0-9]{24}$/.test(raw);
+    const orQuery: any[] = isObjectId
+      ? [{ _id: raw }, { bookingId: raw.toUpperCase() }]
+      : [{ bookingId: raw.toUpperCase() }];
+
+    const booking: any = await Booking.findOne({
+      vendor: new mongoose.Types.ObjectId(vendorId),
+      isDeleted: false,
+      $or: orQuery,
+    })
+      .populate("material", "name unit gst hsn")
+      .populate("user", "name mobile email address")
+      .populate(
+        "vendor",
+        "name email mobile business bankDetails vendorCode",
+      )
+      .lean();
+
+    if (!booking) throw new AppError("Order not found.", 404);
+
+    const vendor = booking.vendor || {};
+    const biz = vendor.business || {};
+    const bank = vendor.bankDetails || {};
+    const material = booking.material || {};
+    const cust = booking.user || {};
+
+    const qty = Number(booking.quantity || 0);
+    const total = Number(booking.totalAmount || 0);
+    const gstAmount = Number(booking.gstAmount || 0);
+    const basic = Math.max(total - gstAmount, 0);
+    const gstRate = Number(material.gst || 0);
+    const cgst = gstAmount / 2;
+    const sgst = gstAmount / 2;
+    const rate = qty ? basic / qty : basic;
+    const issued = new Date(booking.createdAt).toLocaleDateString("en-IN");
+    const vendorName = biz.name || vendor.name || "Vendor Name";
+
+    const html = buildTaxInvoiceHtml({
+      sellerName: vendorName,
+      sellerAddress: biz.address,
+      sellerCity: biz.city,
+      sellerPincode: biz.pincode,
+      sellerState: biz.state,
+      sellerGstin: biz.gstNumber,
+      sellerMobile: vendor.mobile,
+      sellerEmail: vendor.email,
+      sellerPan: biz.panNumber,
+      bankAccountNumber: bank.accountNumber,
+      bankIfsc: bank.ifscCode,
+      bankName: bank.bankName,
+      invoiceNo: booking.bookingId,
+      orderNo: booking.bookingId,
+      issuedDate: issued,
+      paymentMethod: booking.paymentMethod,
+      consigneeName: cust.name || "Customer",
+      consigneeAddress: booking.site || cust.address?.full,
+      consigneeMobile: cust.mobile,
+      dispatchThrough: booking.dispatch?.driverName,
+      vehicleNumber: booking.dispatch?.vehicleNumber,
+      materialName: material.name || "",
+      hsn: material.hsn,
+      unit: booking.unit || material.unit,
+      quantity: qty,
+      rate,
+      basic,
+      gstRate,
+      cgst,
+      sgst,
+      total,
+    });
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(html);
   } catch (error) {
     next(error);
   }

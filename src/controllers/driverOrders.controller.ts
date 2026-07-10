@@ -1,6 +1,6 @@
 import { Response, NextFunction } from "express";
 import mongoose from "mongoose";
-import Booking, { pushStatus } from "../models/Booking.model";
+import Booking, { pushStatus, isCodPaymentMethod } from "../models/Booking.model";
 import Driver from "../models/Driver.model";
 import { AppError } from "../middlewares/errorHandler";
 import { DriverRequest } from "../middlewares/driverAuth.middleware";
@@ -20,6 +20,11 @@ const ACTIVE_STATUSES = [
 ];
 // Statuses the driver can act on as a "new offer" awaiting pickup.
 const OFFER_STATUSES = ["dispatched"];
+// A vendor accepting an order (pre-pack/pre-dispatch) makes it visible as an
+// early, unassigned offer to any driver whose registered pincode matches the
+// delivery pincode — first driver to accept claims it. The vendor's later
+// dispatch-time picker still runs independently and can reassign.
+const EARLY_OFFER_STATUSES = ["accepted", "confirmed"];
 const COMPLETED_STATUSES = ["delivered"];
 const REJECTED_STATUSES = ["cancelled"];
 
@@ -35,7 +40,7 @@ const toUiStatus = (booking: any): UiStatus => {
   return "in_progress";
 };
 
-const formatBooking = (booking: any) => {
+const formatBooking = (booking: any, stage?: "dispatch" | "early") => {
   const vendorName =
     booking.vendor?.business?.name || booking.vendor?.name || "Vendor";
   const vendorAddr =
@@ -55,8 +60,18 @@ const formatBooking = (booking: any) => {
     material: booking.material?.name,
     quantity: booking.quantity,
     unit: booking.unit,
+    isCod: isCodPaymentMethod(booking.paymentMethod),
+    codAmount:
+      isCodPaymentMethod(booking.paymentMethod) && booking.status === "delivered"
+        ? booking.totalAmount || 0
+        : 0,
+    ...(stage ? { stage } : {}),
   };
 };
+
+// Extract the 6-digit pincode out of a driver's free-form address string.
+const driverPincode = (driver: any): string | undefined =>
+  (String(driver?.address?.pincode ?? "").match(/\d{6}/) || [])[0];
 
 const startOfDay = (d = new Date()) =>
   new Date(d.getFullYear(), d.getMonth(), d.getDate());
@@ -158,9 +173,12 @@ export const updateOrderStatus = async (
 
     // A driver must be online to make forward progress on a delivery
     // (accept / pickup / mark delivered). Rejecting is allowed while offline.
+    let driverDoc: any = null;
     if (action !== "reject") {
-      const driver = await Driver.findById(driverId).select("isOnline");
-      if (!driver?.isOnline) {
+      driverDoc = await Driver.findById(driverId).select(
+        "isOnline address.pincode",
+      );
+      if (!driverDoc?.isOnline) {
         throw new AppError(
           "You are offline. Go online to update the delivery status.",
           400,
@@ -168,11 +186,47 @@ export const updateOrderStatus = async (
       }
     }
 
-    const booking = await Booking.findOne({
+    let booking = await Booking.findOne({
       bookingId,
       driver: new mongoose.Types.ObjectId(driverId),
       isDeleted: false,
     });
+
+    // "accept" can also claim an unassigned early offer — a vendor-accepted
+    // order (not yet packed/dispatched) whose delivery pincode matches this
+    // driver's registered pincode. Atomic first-come-first-serve: whoever
+    // claims it first gets `driver` set, everyone else gets null back.
+    if (!booking && action === "accept") {
+      const pin = driverPincode(driverDoc);
+      if (pin) {
+        booking = await Booking.findOneAndUpdate(
+          {
+            bookingId,
+            driver: null,
+            isDeleted: false,
+            status: { $in: EARLY_OFFER_STATUSES },
+            pincode: new RegExp(pin),
+          },
+          {
+            $set: { driver: new mongoose.Types.ObjectId(driverId) },
+            $push: {
+              statusHistory: {
+                status: "accepted",
+                at: new Date(),
+                note: "Driver accepted (early offer)",
+              },
+            },
+          },
+          { new: true },
+        );
+      }
+      if (!booking) {
+        throw new AppError("This delivery is no longer available.", 409);
+      }
+      const populated = await populateBooking(Booking.findById(booking._id));
+      res.json({ success: true, data: formatBooking(populated) });
+      return;
+    }
 
     if (!booking) throw new AppError("Order not found", 404);
 
@@ -207,6 +261,12 @@ export const updateOrderStatus = async (
       }
       // pushStatus stamps deliveryDate = now on delivery.
       pushStatus(booking, "delivered", "Delivered");
+      // COD cash changes hands right here — the customer's payment is now
+      // complete, and this delivery becomes part of the driver's cash-in-hand
+      // (see driverCash.controller.ts).
+      if (isCodPaymentMethod(booking.paymentMethod)) {
+        booking.paymentStatus = "completed";
+      }
     } else if (action === "reject") {
       if (
         !["pending", "accepted", "confirmed", "packed", "dispatched"].includes(
@@ -270,7 +330,10 @@ export const getDashboard = async (
     const weekStart = startOfWeek();
     const monthStart = startOfMonth();
 
-    const driverDoc = await Driver.findById(driverId).select("isOnline");
+    const driverDoc = await Driver.findById(driverId).select(
+      "isOnline address.pincode",
+    );
+    const pin = driverPincode(driverDoc);
 
     // Combined count + earnings for delivered bookings since a given date.
     const periodAgg = (since: Date) =>
@@ -301,7 +364,8 @@ export const getDashboard = async (
       pendingPayoutAgg,
       weekAgg,
       monthAgg,
-      newOffer,
+      dispatchOffer,
+      earlyOffer,
       activeOrder,
     ] = await Promise.all([
       Booking.countDocuments({
@@ -363,6 +427,19 @@ export const getDashboard = async (
           status: { $in: OFFER_STATUSES },
         }).sort({ createdAt: -1 }),
       ),
+      // An early offer = a vendor-accepted booking, not yet assigned to any
+      // driver, whose delivery pincode matches this driver's registered
+      // pincode. Any matching driver can see and claim it.
+      pin
+        ? populateBooking(
+            Booking.findOne({
+              driver: null,
+              isDeleted: false,
+              status: { $in: EARLY_OFFER_STATUSES },
+              pincode: new RegExp(pin),
+            }).sort({ createdAt: -1 }),
+          )
+        : Promise.resolve(null),
       // The currently in-progress order.
       populateBooking(
         Booking.findOne({
@@ -397,7 +474,13 @@ export const getDashboard = async (
             amount: monthAgg[0]?.total || 0,
           },
         },
-        newOffer: newOffer ? formatBooking(newOffer) : null,
+        // Dispatch-stage offers (already assigned to this driver) take
+        // priority over an early, unclaimed pincode-matched offer.
+        newOffer: dispatchOffer
+          ? formatBooking(dispatchOffer, "dispatch")
+          : earlyOffer
+            ? formatBooking(earlyOffer, "early")
+            : null,
         activeOrder: activeOrder ? formatBooking(activeOrder) : null,
         isOnline: driverDoc?.isOnline ?? false,
       },

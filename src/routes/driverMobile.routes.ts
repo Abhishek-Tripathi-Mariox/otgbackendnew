@@ -33,6 +33,11 @@ import {
   markDriverNotificationRead,
   deleteDriverNotification,
 } from "../controllers/driverNotifications.controller";
+import {
+  getCashSummary,
+  createCashDeposit,
+  listCashDeposits,
+} from "../controllers/driverCash.controller";
 import { authenticateDriver } from "../middlewares/driverAuth.middleware";
 import { createUpload } from "../config/s3";
 
@@ -121,5 +126,10 @@ router.patch(
   authenticateDriver,
   updateOrderStatus,
 );
+
+// COD cash reconciliation
+router.get("/cash/summary", authenticateDriver, getCashSummary);
+router.get("/cash/deposits", authenticateDriver, listCashDeposits);
+router.post("/cash/deposits", authenticateDriver, createCashDeposit);
 
 export default router;

@@ -11,6 +11,7 @@ import {
   toggleVendorStatus,
   approveVendor,
   rejectVendor,
+  uploadVendorDoc,
   getVendorMaterials,
   addVendorMaterial,
   updateVendorMaterial,
@@ -24,6 +25,9 @@ const router = Router();
 
 // All routes require authentication
 router.use(authenticate);
+
+// Upload a vendor document (returns S3 URL)
+router.post("/upload-doc", uploadVendorDoc);
 
 // Get states list
 router.get("/states", getStates);

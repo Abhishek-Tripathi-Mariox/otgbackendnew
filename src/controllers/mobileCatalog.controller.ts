@@ -149,7 +149,7 @@ export const getMaterials = async (
     const [materials, total] = await Promise.all([
       Material.find(query)
         .select(
-          "name images brand category subCategory unit minOrderQty mrp sellingPrice finalSellingPrice gst requestQuote",
+          "name images brand category subCategory unit minOrderQty mrp sellingPrice finalSellingPrice gst requestQuote transportation",
         )
         .populate("category", "name")
         .populate("subCategory", "name")

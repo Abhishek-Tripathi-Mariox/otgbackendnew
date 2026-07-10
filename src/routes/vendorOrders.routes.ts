@@ -11,10 +11,15 @@ import {
   dispatchOrder,
   getAssignableDrivers,
   uploadVendorImage,
+  getVendorInvoiceHtml,
 } from "../controllers/vendorOrders.controller";
 import { authenticateVendor } from "../middlewares/vendorAuth.middleware";
 
 const router = Router();
+
+// Printable HTML tax invoice — authed via ?token= so it opens in the browser.
+// Must be registered BEFORE the global authenticateVendor middleware.
+router.get("/:id/invoice/html", getVendorInvoiceHtml);
 
 router.use(authenticateVendor);
 

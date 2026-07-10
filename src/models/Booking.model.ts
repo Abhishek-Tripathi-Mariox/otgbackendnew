@@ -15,6 +15,14 @@ export type BookingStatus =
   | "cancelled"
   | "confirmed"; // legacy alias of "accepted"
 
+// `paymentMethod` is a free-text label chosen in the customer app (e.g. "Cash
+// on Delivery", "PhonePe"); this is the one shared check for "was this a COD
+// order" used by the driver cash-collection ledger. Use `COD_PAYMENT_METHOD_REGEX`
+// directly in Mongo query filters, and `isCodPaymentMethod` for in-JS checks.
+export const COD_PAYMENT_METHOD_REGEX = /cash\s*on\s*delivery|^cod$/i;
+export const isCodPaymentMethod = (paymentMethod?: string | null): boolean =>
+  COD_PAYMENT_METHOD_REGEX.test(String(paymentMethod ?? "").trim());
+
 export const BOOKING_STATUSES: BookingStatus[] = [
   "pending",
   "accepted",

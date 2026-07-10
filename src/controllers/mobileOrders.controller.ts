@@ -13,6 +13,7 @@ import {
   resolveCart,
 } from "../services/offerEngine";
 import { recordOfferRedemption } from "./mobileOffers.controller";
+import { buildTaxInvoiceHtml } from "../utils/taxInvoiceHtml";
 
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
 
@@ -485,18 +486,6 @@ export const getOrderTracking = async (
 // (so it can be opened directly in the device browser, where the user can use
 // "Save as PDF" / Print) or the standard Authorization header. No PDF library
 // is needed — the browser handles PDF export.
-const escapeHtml = (v: unknown): string =>
-  String(v ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-
-const money = (n: number): string =>
-  `₹${Number(n || 0).toLocaleString("en-IN", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
-
 export const getOrderInvoiceHtml = async (
   req: Request,
   res: Response,
@@ -532,90 +521,66 @@ export const getOrderInvoiceHtml = async (
       isDeleted: false,
       $or: orQuery,
     })
-      .populate("material", "name unit")
-      .populate("vendor", "name business")
-      .populate("user", "name mobile email")
+      .populate("material", "name unit hsn gst")
+      .populate("vendor", "name business bankDetails mobile email")
+      .populate("user", "name mobile email address")
       .lean();
 
     if (!booking) throw new AppError("Order not found.", 404);
+    if (booking.status !== "delivered") {
+      throw new AppError("Invoice is available once the order is delivered.", 400);
+    }
 
-    const qty = booking.quantity || 0;
-    const unitPrice = booking.price || 0;
-    const gstAmount = booking.gstAmount || 0;
-    const discount = booking.discountAmount || 0;
-    const total = booking.totalAmount || 0;
-    const subtotal = Math.max(total - gstAmount + discount, 0);
-    const issued = new Date(booking.createdAt).toLocaleDateString("en-IN", {
-      day: "numeric",
-      month: "short",
-      year: "numeric",
+    const vendor = booking.vendor || {};
+    const biz = vendor.business || {};
+    const bank = vendor.bankDetails || {};
+    const material = booking.material || {};
+    const cust = booking.user || {};
+
+    const qty = Number(booking.quantity || 0);
+    const total = Number(booking.totalAmount || 0);
+    const gstAmount = Number(booking.gstAmount || 0);
+    const basic = Math.max(total - gstAmount, 0);
+    const gstRate = Number(material.gst || 0);
+    const cgst = gstAmount / 2;
+    const sgst = gstAmount / 2;
+    const rate = qty ? basic / qty : basic;
+    const issued = new Date(booking.createdAt).toLocaleDateString("en-IN");
+    const vendorName = biz.name || vendor.name || "OTG";
+
+    const html = buildTaxInvoiceHtml({
+      sellerName: vendorName,
+      sellerAddress: biz.address,
+      sellerCity: biz.city,
+      sellerPincode: biz.pincode,
+      sellerState: biz.state,
+      sellerGstin: biz.gstNumber,
+      sellerMobile: vendor.mobile,
+      sellerEmail: vendor.email,
+      sellerPan: biz.panNumber,
+      bankAccountNumber: bank.accountNumber,
+      bankIfsc: bank.ifscCode,
+      bankName: bank.bankName,
+      invoiceNo: booking.bookingId,
+      orderNo: booking.bookingId,
+      issuedDate: issued,
+      paymentMethod: booking.paymentMethod,
+      consigneeName: cust.name || "Customer",
+      consigneeAddress: booking.site || cust.address?.full,
+      consigneeMobile: cust.mobile,
+      dispatchThrough: booking.dispatch?.driverName,
+      vehicleNumber: booking.dispatch?.vehicleNumber,
+      materialName: material.name || "",
+      hsn: material.hsn,
+      unit: booking.unit || material.unit,
+      quantity: qty,
+      rate,
+      basic,
+      gstRate,
+      cgst,
+      sgst,
+      total,
     });
-    const vendorName =
-      booking.vendor?.business?.name || booking.vendor?.name || "OTG";
-
-    const html = `<!doctype html>
-<html><head><meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Invoice ${escapeHtml(booking.bookingId)}</title>
-<style>
-  body{font-family:Arial,Helvetica,sans-serif;color:#1d262d;margin:0;padding:24px;background:#f5f5f5}
-  .sheet{max-width:720px;margin:0 auto;background:#fff;border-radius:12px;padding:28px;box-shadow:0 2px 8px rgba(0,0,0,.08)}
-  h1{font-size:22px;margin:0;color:#E48714}
-  .muted{color:#6a7282;font-size:13px}
-  .row{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
-  table{width:100%;border-collapse:collapse;margin-top:18px}
-  th,td{text-align:left;padding:10px;border-bottom:1px solid #eee;font-size:14px}
-  th{background:#faf6f0;color:#6a7282;font-weight:600}
-  td.r,th.r{text-align:right}
-  .totals{margin-top:16px;margin-left:auto;width:280px}
-  .totals .row{padding:6px 0;font-size:14px}
-  .grand{font-weight:700;font-size:16px;border-top:2px solid #E48714;padding-top:10px;margin-top:6px}
-  .btn{display:inline-block;margin-top:20px;background:#E48714;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;border:0;font-size:14px;cursor:pointer}
-  @media print{.btn{display:none}body{background:#fff;padding:0}.sheet{box-shadow:none}}
-</style></head>
-<body>
-  <div class="sheet">
-    <div class="row">
-      <div><h1>Invoice</h1><div class="muted">${escapeHtml(vendorName)}</div></div>
-      <div style="text-align:right">
-        <div><b>#${escapeHtml(booking.bookingId)}</b></div>
-        <div class="muted">Date: ${escapeHtml(issued)}</div>
-        <div class="muted">Status: ${escapeHtml(booking.status)}</div>
-      </div>
-    </div>
-    <div class="row" style="margin-top:16px">
-      <div>
-        <div class="muted">Billed To</div>
-        <div><b>${escapeHtml(booking.user?.name || "Customer")}</b></div>
-        <div class="muted">${escapeHtml(booking.user?.mobile || "")}</div>
-        ${booking.site ? `<div class="muted">${escapeHtml(booking.site)}</div>` : ""}
-      </div>
-      <div style="text-align:right">
-        <div class="muted">Payment</div>
-        <div>${escapeHtml(booking.paymentStatus || "pending")}</div>
-        ${booking.paymentMethod ? `<div class="muted">${escapeHtml(booking.paymentMethod)}</div>` : ""}
-      </div>
-    </div>
-    <table>
-      <thead><tr><th>Material</th><th class="r">Qty</th><th class="r">Unit Price</th><th class="r">Amount</th></tr></thead>
-      <tbody>
-        <tr>
-          <td>${escapeHtml(booking.material?.name || "Material")}</td>
-          <td class="r">${escapeHtml(qty)} ${escapeHtml(booking.unit || booking.material?.unit || "")}</td>
-          <td class="r">${money(unitPrice)}</td>
-          <td class="r">${money(unitPrice * qty)}</td>
-        </tr>
-      </tbody>
-    </table>
-    <div class="totals">
-      <div class="row"><span class="muted">Subtotal</span><span>${money(subtotal)}</span></div>
-      ${discount ? `<div class="row"><span class="muted">Discount</span><span>- ${money(discount)}</span></div>` : ""}
-      <div class="row"><span class="muted">GST</span><span>${money(gstAmount)}</span></div>
-      <div class="row grand"><span>Total</span><span>${money(total)}</span></div>
-    </div>
-    <button class="btn" onclick="window.print()">Download / Print PDF</button>
-  </div>
-</body></html>`;
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.send(html);
