@@ -4,12 +4,11 @@ import Driver from "../models/Driver.model";
 import { AppError } from "../middlewares/errorHandler";
 import { DriverRequest } from "../middlewares/driverAuth.middleware";
 import { uploadBufferToS3 } from "../config/s3";
+import { generateOtp as generateOTP, sendOtpSms } from "../services/otpService";
 
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
 const OTP_EXPIRY_SECONDS = 45;
 const MAX_OTP_ATTEMPTS = 5;
-
-const generateOTP = (): string => "123456"; // TODO: random in prod
 
 const generateDriverToken = (driverId: string): string =>
   jwt.sign({ id: driverId, type: "driver" }, JWT_SECRET, { expiresIn: "30d" });
@@ -96,7 +95,7 @@ export const sendOTP = async (
 
     await driver.save();
 
-    console.log(`Driver OTP for ${mobile}: ${otp}`);
+    await sendOtpSms(mobile, otp);
 
     res.json({
       success: true,
@@ -194,7 +193,7 @@ export const resendOTP = async (
     driver.otpAttempts = (driver.otpAttempts || 0) + 1;
     await driver.save();
 
-    console.log(`Driver OTP (resend) for ${mobile}: ${otp}`);
+    await sendOtpSms(mobile, otp);
 
     res.json({
       success: true,

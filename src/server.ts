@@ -41,6 +41,10 @@ import appSettingsRoutes from "./routes/appSettings.routes";
 import transactionRoutes from "./routes/transaction.routes";
 import reviewRoutes from "./routes/review.routes";
 import faqRoutes from "./routes/faq.routes";
+import mobilePaymentsRoutes from "./routes/mobilePayments.routes";
+import paymentsRoutes from "./routes/payments.routes";
+import razorpayWebhookRoutes from "./routes/razorpayWebhook.routes";
+import geocodeRoutes from "./routes/geocode.routes";
 import { seedAdmin } from "./config/seed";
 
 const app: Application = express();
@@ -49,6 +53,14 @@ const USE_HTTPS = process.env.USE_HTTPS === "true";
 
 // Middleware
 app.use(cors());
+// Razorpay webhook signature verification needs the exact raw request body,
+// so this route must get its own raw-body parser BEFORE the global
+// express.json() below (which would otherwise consume/parse the body first).
+app.use(
+  "/api/webhooks/razorpay",
+  express.raw({ type: "application/json" }),
+  razorpayWebhookRoutes,
+);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -85,6 +97,9 @@ app.use("/api/app-settings", appSettingsRoutes);
 app.use("/api/transactions", transactionRoutes);
 app.use("/api/reviews", reviewRoutes);
 app.use("/api/faqs", faqRoutes);
+app.use("/api/mobile/payments", mobilePaymentsRoutes);
+app.use("/api/payments", paymentsRoutes);
+app.use("/api/geocode", geocodeRoutes);
 
 // Health check
 app.get("/api/health", (req, res) => {

@@ -55,7 +55,10 @@ const formatBooking = (booking: any, stage?: "dispatch" | "early") => {
     rawStatus: booking.status,
     pickup,
     drop: booking.site || "Delivery site not set",
-    date: booking.createdAt,
+    date:
+      booking.status === "delivered"
+        ? booking.deliveryDate || booking.updatedAt
+        : booking.createdAt,
     earnings: booking.driverFee || 0,
     material: booking.material?.name,
     quantity: booking.quantity,

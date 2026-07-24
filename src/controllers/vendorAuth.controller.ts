@@ -7,15 +7,11 @@ import Notification from "../models/Notification.model";
 import SupportTicket from "../models/SupportTicket.model";
 import HelpSettings from "../models/HelpSettings.model";
 import { AppError } from "../middlewares/errorHandler";
+import { generateOtp as generateOTP, sendOtpSms } from "../services/otpService";
 
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
 const OTP_EXPIRY_SECONDS = 45;
 const MAX_OTP_ATTEMPTS = 5;
-
-const generateOTP = (): string => {
-  // TODO: Use random OTP in production
-  return "123456";
-};
 
 const generateVendorToken = (vendorId: string): string => {
   return jwt.sign({ id: vendorId, type: "vendor" }, JWT_SECRET, {
@@ -105,8 +101,7 @@ export const sendOTP = async (
 
     await vendor.save();
 
-    // TODO: Send OTP via SMS service (Twilio, MSG91, etc.)
-    console.log(`OTP for vendor ${mobile}: ${otp}`);
+    await sendOtpSms(mobile, otp);
 
     res.json({
       success: true,
@@ -276,8 +271,7 @@ export const resendOTP = async (
 
     await vendor.save();
 
-    // TODO: Send OTP via SMS service
-    console.log(`Resend OTP for vendor ${mobile}: ${otp}`);
+    await sendOtpSms(mobile, otp);
 
     res.json({
       success: true,

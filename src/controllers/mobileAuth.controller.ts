@@ -3,16 +3,11 @@ import jwt from "jsonwebtoken";
 import User from "../models/User.model";
 import { AppError } from "../middlewares/errorHandler";
 import { uploadBufferToS3 } from "../config/s3";
+import { generateOtp as generateOTP, sendOtpSms } from "../services/otpService";
 
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
 const OTP_EXPIRY_SECONDS = 45; // OTP expires after 45 seconds
 const MAX_OTP_ATTEMPTS = 5;
-
-// Generate 6 digit OTP
-const generateOTP = (): string => {
-  // TODO: Use random OTP in production
-  return "123456";
-};
 
 // Generate JWT token for user
 const generateUserToken = (userId: string): string => {
@@ -106,12 +101,7 @@ export const sendOTP = async (
 
     await user.save();
 
-    // TODO: Send OTP via SMS service (Twilio, MSG91, etc.)
-    // For now, we'll log it (remove in production)
-    console.log(`OTP for ${mobile}: ${otp}`);
-
-    // In production, you would integrate with SMS service:
-    // await sendSMS(mobile, `Your OTP for OTG is: ${otp}. Valid for 45 seconds.`);
+    await sendOtpSms(mobile, otp);
 
     res.json({
       success: true,
@@ -290,8 +280,7 @@ export const resendOTP = async (
 
     await user.save();
 
-    // TODO: Send OTP via SMS service
-    console.log(`Resend OTP for ${mobile}: ${otp}`);
+    await sendOtpSms(mobile, otp);
 
     res.json({
       success: true,

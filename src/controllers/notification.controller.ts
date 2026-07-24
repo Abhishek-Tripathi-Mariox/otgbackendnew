@@ -4,6 +4,10 @@ import User from "../models/User.model";
 import Vendor from "../models/Vendor.model";
 import Driver from "../models/Driver.model";
 import { AuthRequest } from "../types";
+import { sendPush } from "../services/pushService";
+
+const collectTokens = (docs: Array<{ deviceInfo?: { fcmToken?: string } }>): string[] =>
+  docs.map((d) => d.deviceInfo?.fcmToken).filter((t): t is string => Boolean(t));
 
 // GET /api/notifications - List all notifications
 export const getNotifications = async (
@@ -113,6 +117,7 @@ export const sendNotification = async (
     let userCount = 0;
     let vendorCount = 0;
     let driverCount = 0;
+    const tokens: string[] = [];
     const specificRecipients: {
       users: string[];
       vendors: string[];
@@ -124,54 +129,70 @@ export const sendNotification = async (
     };
 
     switch (targetType) {
-      case "all":
-        userCount = await User.countDocuments({
-          isDeleted: false,
-          status: "active",
-        });
-        vendorCount = await Vendor.countDocuments({
-          isDeleted: false,
-          status: "active",
-        });
-        driverCount = await Driver.countDocuments({
-          isDeleted: false,
-          status: "active",
-        });
+      case "all": {
+        const [users, vendors, drivers] = await Promise.all([
+          User.find({ isDeleted: false, status: "active" }).select("deviceInfo.fcmToken"),
+          Vendor.find({ isDeleted: false, status: "active" }).select("deviceInfo.fcmToken"),
+          Driver.find({ isDeleted: false, status: "active" }).select("deviceInfo.fcmToken"),
+        ]);
+        userCount = users.length;
+        vendorCount = vendors.length;
+        driverCount = drivers.length;
+        tokens.push(...collectTokens(users), ...collectTokens(vendors), ...collectTokens(drivers));
         break;
+      }
 
-      case "users":
-        userCount = await User.countDocuments({
-          isDeleted: false,
-          status: "active",
-        });
+      case "users": {
+        const users = await User.find({ isDeleted: false, status: "active" }).select(
+          "deviceInfo.fcmToken",
+        );
+        userCount = users.length;
+        tokens.push(...collectTokens(users));
         break;
+      }
 
-      case "vendors":
-        vendorCount = await Vendor.countDocuments({
-          isDeleted: false,
-          status: "active",
-        });
+      case "vendors": {
+        const vendors = await Vendor.find({ isDeleted: false, status: "active" }).select(
+          "deviceInfo.fcmToken",
+        );
+        vendorCount = vendors.length;
+        tokens.push(...collectTokens(vendors));
         break;
+      }
 
-      case "drivers":
-        driverCount = await Driver.countDocuments({
-          isDeleted: false,
-          status: "active",
-        });
+      case "drivers": {
+        const drivers = await Driver.find({ isDeleted: false, status: "active" }).select(
+          "deviceInfo.fcmToken",
+        );
+        driverCount = drivers.length;
+        tokens.push(...collectTokens(drivers));
         break;
+      }
 
-      case "specific":
+      case "specific": {
         if (userIds && Array.isArray(userIds) && userIds.length > 0) {
           specificRecipients.users = userIds;
           userCount = userIds.length;
+          const users = await User.find({ _id: { $in: userIds } }).select(
+            "deviceInfo.fcmToken",
+          );
+          tokens.push(...collectTokens(users));
         }
         if (vendorIds && Array.isArray(vendorIds) && vendorIds.length > 0) {
           specificRecipients.vendors = vendorIds;
           vendorCount = vendorIds.length;
+          const vendors = await Vendor.find({ _id: { $in: vendorIds } }).select(
+            "deviceInfo.fcmToken",
+          );
+          tokens.push(...collectTokens(vendors));
         }
         if (driverIds && Array.isArray(driverIds) && driverIds.length > 0) {
           specificRecipients.drivers = driverIds;
           driverCount = driverIds.length;
+          const drivers = await Driver.find({ _id: { $in: driverIds } }).select(
+            "deviceInfo.fcmToken",
+          );
+          tokens.push(...collectTokens(drivers));
         }
         if (userCount === 0 && vendorCount === 0 && driverCount === 0) {
           res.status(400).json({
@@ -181,6 +202,7 @@ export const sendNotification = async (
           return;
         }
         break;
+      }
 
       default:
         res.status(400).json({ success: false, message: "Invalid target type" });
@@ -198,8 +220,10 @@ export const sendNotification = async (
       createdBy: req.admin!._id,
     });
 
-    // TODO: Integrate with Firebase FCM to actually push notifications
-    // For now we store the record; actual push can be added when Firebase config is active
+    const pushResult = await sendPush(tokens, title, message);
+    notification.pushSent = pushResult.sent;
+    notification.pushFailed = pushResult.failed;
+    await notification.save();
 
     res.status(201).json({
       success: true,

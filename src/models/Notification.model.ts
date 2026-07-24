@@ -16,6 +16,11 @@ export interface INotification extends Document {
   };
   status: "draft" | "sent" | "failed";
   sentAt: Date | null;
+  // Actual FCM push delivery counts (separate from `status`, which stays
+  // "sent" regardless of whether push succeeded — pushSent/pushFailed are
+  // 0/0 whenever Firebase isn't configured).
+  pushSent?: number;
+  pushFailed?: number;
   createdBy: mongoose.Types.ObjectId;
   readByVendors: mongoose.Types.ObjectId[];
   deletedByVendors: mongoose.Types.ObjectId[];
@@ -64,6 +69,8 @@ const notificationSchema = new Schema<INotification>(
       default: "sent",
     },
     sentAt: { type: Date, default: null },
+    pushSent: { type: Number, default: 0 },
+    pushFailed: { type: Number, default: 0 },
     createdBy: {
       type: Schema.Types.ObjectId,
       ref: "Admin",

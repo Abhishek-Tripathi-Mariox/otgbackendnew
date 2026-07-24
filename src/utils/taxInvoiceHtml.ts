@@ -9,7 +9,7 @@ export const escInv = (v: unknown): string =>
     .replace(/>/g, "&gt;");
 
 export const inr = (n: number): string =>
-  `₹ ${Number(n || 0).toLocaleString("en-IN", {
+  `₹&nbsp;${Number(n || 0).toLocaleString("en-IN", {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   })}`;
@@ -115,17 +115,24 @@ export const buildTaxInvoiceHtml = (p: TaxInvoiceParams): string => {
 <title>Tax Invoice ${escInv(p.invoiceNo)}</title>
 <style>
   *{box-sizing:border-box}
+  html,body{max-width:100%;overflow-x:hidden}
   body{font-family:Arial,Helvetica,sans-serif;color:#000;margin:0;padding:16px;font-size:12px}
   .sheet{max-width:820px;margin:0 auto;border:1px solid #000}
-  table{width:100%;border-collapse:collapse}
-  td,th{border:1px solid #000;padding:4px 6px;vertical-align:top}
+  table{width:100%;border-collapse:collapse;table-layout:fixed}
+  td,th{border:1px solid #000;padding:4px 6px;vertical-align:top;word-break:break-word;overflow-wrap:anywhere}
   .nob td,.nob th{border:none}
-  .c{text-align:center}.r{text-align:right}.b{font-weight:bold}
+  .c{text-align:center}.r{text-align:right;white-space:nowrap}.b{font-weight:bold}
   h1{font-size:18px;margin:6px 0}
   .title{font-size:14px;font-weight:bold;text-align:center;letter-spacing:1px}
   .muted{color:#333}
   .btn{display:inline-block;margin:12px auto 0;background:#E48714;color:#fff;padding:8px 16px;border-radius:6px;border:0;cursor:pointer;font-size:13px}
   @media print{.btn{display:none}body{padding:0}}
+  @media (max-width:480px){
+    body{padding:6px;font-size:9.5px}
+    td,th{padding:3px 4px}
+    .title{font-size:12px}
+    h1{font-size:15px}
+  }
 </style></head>
 <body>
   <div class="sheet">

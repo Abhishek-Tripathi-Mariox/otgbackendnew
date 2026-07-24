@@ -74,6 +74,8 @@ export interface IBookingDocument extends Document {
   status: BookingStatus;
   paymentStatus: "pending" | "partial" | "completed";
   paymentMethod?: string;
+  paymentGateway?: "razorpay" | "cod" | "manual";
+  razorpayOrderId?: string;
   notes?: string;
   deliveryDate?: Date;
   qc?: IBookingQC;
@@ -173,6 +175,15 @@ const BookingSchema: Schema = new Schema(
     paymentMethod: {
       type: String,
       trim: true,
+    },
+    paymentGateway: {
+      type: String,
+      enum: ["razorpay", "cod", "manual"],
+    },
+    razorpayOrderId: {
+      type: String,
+      trim: true,
+      index: true,
     },
     notes: {
       type: String,
