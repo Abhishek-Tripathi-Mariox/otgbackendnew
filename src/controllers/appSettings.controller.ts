@@ -64,7 +64,7 @@ export const updateAppSettings = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const { bulkBanner } = req.body;
+    const { bulkBanner, companyProfile } = req.body;
 
     const settings = await getOrCreateSettings();
 
@@ -84,6 +84,30 @@ export const updateAppSettings = async (
             : settings.bulkBanner?.buttonText,
       };
       settings.markModified("bulkBanner");
+    }
+
+    if (companyProfile) {
+      const existing = settings.companyProfile || ({} as Record<string, string>);
+      const fields = [
+        "name",
+        "gstin",
+        "pan",
+        "address",
+        "city",
+        "state",
+        "pincode",
+        "bankAccountNumber",
+        "bankIfsc",
+        "bankName",
+      ] as const;
+      const updated: Record<string, string> = { ...existing };
+      for (const field of fields) {
+        if (companyProfile[field] !== undefined) {
+          updated[field] = String(companyProfile[field]).trim();
+        }
+      }
+      settings.companyProfile = updated as typeof settings.companyProfile;
+      settings.markModified("companyProfile");
     }
 
     if (req.admin?._id) {

@@ -8,6 +8,7 @@ export type BookingStatus =
   | "accepted"
   | "qc_pending"
   | "qc_approved"
+  | "qc_rejected"
   | "packed"
   | "dispatched"
   | "in_transit"
@@ -28,6 +29,7 @@ export const BOOKING_STATUSES: BookingStatus[] = [
   "accepted",
   "qc_pending",
   "qc_approved",
+  "qc_rejected",
   "packed",
   "dispatched",
   "in_transit",
@@ -76,6 +78,10 @@ export interface IBookingDocument extends Document {
   paymentMethod?: string;
   paymentGateway?: "razorpay" | "cod" | "manual";
   razorpayOrderId?: string;
+  // Vendors who explicitly declined this order — excluded when the order is
+  // reopened/re-notified to remaining vendors so it isn't re-offered to
+  // someone who already turned it down.
+  rejectedByVendors?: mongoose.Types.ObjectId[];
   notes?: string;
   deliveryDate?: Date;
   qc?: IBookingQC;
@@ -84,6 +90,10 @@ export interface IBookingDocument extends Document {
   vehicleType?: "2-wheeler" | "3-wheeler" | "4-wheeler" | "6-wheeler";
   gstAmount?: number;
   discountAmount?: number;
+  // Per-material "Convenience Fee" (Material.transportation) applied at
+  // checkout — a flat/per-unit delivery-type charge configured by the admin
+  // per product, added to totalAmount but not itself GST/discount-adjusted.
+  convenienceFee?: number;
   statusHistory?: IBookingStatusHistory[];
   isDeleted: boolean;
   deletedAt?: Date;
@@ -185,6 +195,12 @@ const BookingSchema: Schema = new Schema(
       trim: true,
       index: true,
     },
+    rejectedByVendors: [
+      {
+        type: Schema.Types.ObjectId,
+        ref: "Vendor",
+      },
+    ],
     notes: {
       type: String,
       trim: true,
@@ -218,6 +234,11 @@ const BookingSchema: Schema = new Schema(
     discountAmount: {
       type: Number,
       min: [0, "Discount amount cannot be negative"],
+      default: 0,
+    },
+    convenienceFee: {
+      type: Number,
+      min: [0, "Convenience fee cannot be negative"],
       default: 0,
     },
     statusHistory: {

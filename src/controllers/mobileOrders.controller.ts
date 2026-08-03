@@ -3,8 +3,6 @@ import jwt from "jsonwebtoken";
 import Booking, { isCodPaymentMethod } from "../models/Booking.model";
 import Material from "../models/Material.model";
 import User from "../models/User.model";
-import Vendor from "../models/Vendor.model";
-import Notification from "../models/Notification.model";
 import { AppError } from "../middlewares/errorHandler";
 import { UserRequest } from "../middlewares/userAuth.middleware";
 import {
@@ -14,6 +12,7 @@ import {
 } from "../services/offerEngine";
 import { recordOfferRedemption } from "./mobileOffers.controller";
 import { buildTaxInvoiceHtml } from "../utils/taxInvoiceHtml";
+import { findMatchingVendors, notifyVendors } from "../services/vendorNotify";
 
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
 
@@ -35,8 +34,26 @@ export interface CartLine {
   price: number;
   gstAmount: number;
   lineDiscount: number;
+  convenienceFee: number;
   totalAmount: number;
 }
+
+/**
+ * The per-material "Convenience Fee" configured by the admin on the
+ * Materials form (Material.transportation). "per_km" has no distance data
+ * available anywhere in this codebase yet (no routing/Distance-Matrix call),
+ * so it's treated the same as "fixed" rather than silently guessing a
+ * distance — real per-km pricing is a future enhancement.
+ */
+const computeConvenienceFee = (
+  transportation: { type?: string; charge?: number } | undefined,
+  quantity: number,
+): number => {
+  const charge = Number(transportation?.charge) || 0;
+  if (!transportation || transportation.type === "free" || charge <= 0) return 0;
+  if (transportation.type === "per_unit") return +(charge * quantity).toFixed(2);
+  return +charge.toFixed(2); // "fixed" and "per_km" (see caveat above)
+};
 
 export interface CartPricingResult {
   lines: CartLine[];
@@ -149,7 +166,15 @@ export const computeCartPricing = async (
         : Math.round(((line.gross / grossTotal) * totalDiscount) * 100) / 100;
     discountAllocated += lineDiscount;
 
-    const totalAmount = Math.max(0, line.gross - lineDiscount);
+    // GST is derived from the product price only (post-discount, pre-fee) —
+    // the convenience fee is a separate delivery-type charge, not part of
+    // the GST-inclusive product price.
+    const productAmount = Math.max(0, line.gross - lineDiscount);
+    const convenienceFee = computeConvenienceFee(
+      line.material.transportation,
+      line.quantity,
+    );
+    const totalAmount = productAmount + convenienceFee;
 
     const sentGst = gstByMaterialId.get(line.material._id.toString());
     let gstAmount = 0;
@@ -158,7 +183,7 @@ export const computeCartPricing = async (
     } else {
       const rate = Number(line.material.gst) || 0;
       if (rate > 0) {
-        gstAmount = +(totalAmount - totalAmount / (1 + rate / 100)).toFixed(2);
+        gstAmount = +(productAmount - productAmount / (1 + rate / 100)).toFixed(2);
       }
     }
 
@@ -168,6 +193,7 @@ export const computeCartPricing = async (
       price: line.price,
       gstAmount,
       lineDiscount: +lineDiscount.toFixed(2),
+      convenienceFee,
       totalAmount,
     });
     grandTotal += totalAmount;
@@ -216,6 +242,7 @@ export const createBookingsFromPricing = async (
       totalAmount: line.totalAmount,
       gstAmount: line.gstAmount,
       discountAmount: line.lineDiscount,
+      convenienceFee: line.convenienceFee,
       site: opts.site,
       pincode: deliveryPincode || undefined,
       notes: opts.notes,
@@ -238,25 +265,17 @@ export const createBookingsFromPricing = async (
   }
 
   if (deliveryPincode) {
-    const matchingVendors = await Vendor.find({
-      "business.pincode": new RegExp(deliveryPincode),
-      status: "active",
-      approvalStatus: "approved",
-      isDeleted: false,
-    })
-      .select("_id")
-      .lean();
-
-    if (matchingVendors.length > 0) {
-      const vendorIds = matchingVendors.map((v) => v._id);
-      await Notification.create({
+    const matchingVendorIds = await findMatchingVendors(deliveryPincode);
+    if (matchingVendorIds.length > 0) {
+      // Link to the first booking (common single-line-cart case) and its
+      // material's first image, so the vendor app can deep-link and show a
+      // product photo on this notification.
+      const firstBooking = created[0];
+      await notifyVendors(matchingVendorIds, {
         title: "New order available",
         message: `A new order is available in your area (pincode ${deliveryPincode}). Accept it before another vendor does.`,
-        targetType: "specific",
-        specificRecipients: { users: [], vendors: vendorIds, drivers: [] },
-        sentTo: { userCount: 0, vendorCount: vendorIds.length, driverCount: 0 },
-        status: "sent",
-        sentAt: new Date(),
+        booking: firstBooking?._id,
+        image: firstBooking?.material?.images?.[0],
         createdBy: userId,
       });
     }
@@ -300,6 +319,7 @@ export const listMyOrders = async (
           "confirmed",
           "qc_pending",
           "qc_approved",
+          "qc_rejected",
           "packed",
           "dispatched",
           "in_transit",
@@ -448,6 +468,7 @@ const STATUS_RANK: Record<string, number> = {
   confirmed: 1,
   qc_pending: 2,
   qc_approved: 2,
+  qc_rejected: 2,
   packed: 3,
   dispatched: 4,
   in_transit: 5,
@@ -590,6 +611,9 @@ export const getOrderInvoiceHtml = async (
     if (!booking) throw new AppError("Order not found.", 404);
     if (booking.status !== "delivered") {
       throw new AppError("Invoice is available once the order is delivered.", 400);
+    }
+    if (booking.paymentStatus !== "completed") {
+      throw new AppError("Invoice is available once payment is confirmed.", 400);
     }
 
     const vendor = booking.vendor || {};

@@ -12,6 +12,7 @@ import {
 } from "../utils/vendorAllocation";
 import { uploadBufferToS3 } from "../config/s3";
 import { buildTaxInvoiceHtml } from "../utils/taxInvoiceHtml";
+import { findMatchingVendors, notifyVendors } from "../services/vendorNotify";
 
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
 
@@ -28,6 +29,7 @@ type UiStatus =
   | "Accepted"
   | "QC Pending"
   | "QC Approved"
+  | "QC Rejected"
   | "Packed"
   | "Dispatched"
   | "In Transit"
@@ -42,6 +44,7 @@ const RAW_TO_UI: Record<string, UiStatus> = {
   confirmed: "Accepted",
   qc_pending: "QC Pending",
   qc_approved: "QC Approved",
+  qc_rejected: "QC Rejected",
   packed: "Packed",
   dispatched: "Dispatched",
   in_transit: "In Transit",
@@ -56,6 +59,7 @@ const UI_TO_RAW: Partial<Record<UiStatus, string[]>> = {
   Accepted: ["accepted", "confirmed"],
   "QC Pending": ["qc_pending"],
   "QC Approved": ["qc_approved"],
+  "QC Rejected": ["qc_rejected"],
   Packed: ["packed"],
   Dispatched: ["dispatched"],
   "In Transit": ["in_transit"],
@@ -335,6 +339,22 @@ export const updateOrderStatus = async (
             409,
           );
         }
+
+        // Tell the other vendors who were originally notified about this
+        // order that it's no longer available, so their claimable list and
+        // notifications clear instead of them finding out only on next poll.
+        if (claimed.pincode) {
+          const otherVendorIds = await findMatchingVendors(claimed.pincode, [
+            vendorObjId,
+          ]);
+          await notifyVendors(otherVendorIds, {
+            title: "Order no longer available",
+            message: "An order in your area has been claimed by another vendor.",
+            booking: claimed._id,
+            createdBy: vendorObjId,
+          });
+        }
+
         const populated = await populateBooking(
           Booking.findById(claimed._id),
         );
@@ -357,9 +377,36 @@ export const updateOrderStatus = async (
       if (!["pending", "accepted", "confirmed"].includes(booking.status)) {
         throw new AppError("This order can no longer be rejected.", 400);
       }
-      pushStatus(booking, "cancelled", reason);
+
+      if (!Array.isArray(booking.rejectedByVendors)) booking.rejectedByVendors = [];
+      booking.rejectedByVendors.push(vendorObjId);
       if (reason) {
         booking.notes = `${booking.notes ? booking.notes + "\n" : ""}Rejected: ${reason}`;
+      }
+
+      // Try to reopen the order for other eligible (matching pincode,
+      // approved, not-yet-rejected-by) vendors instead of hard-cancelling —
+      // only fall back to cancelling if nobody else is left to offer it to.
+      const remainingVendorIds = booking.pincode
+        ? await findMatchingVendors(booking.pincode, booking.rejectedByVendors)
+        : [];
+
+      if (remainingVendorIds.length > 0) {
+        booking.vendor = null;
+        pushStatus(
+          booking,
+          "pending",
+          reason ? `Declined by vendor: ${reason}` : "Declined by vendor",
+        );
+        await notifyVendors(remainingVendorIds, {
+          title: "New order available",
+          message:
+            "A previously-claimed order in your area is available again. Accept it before another vendor does.",
+          booking: booking._id,
+          createdBy: vendorObjId,
+        });
+      } else {
+        pushStatus(booking, "cancelled", reason);
       }
     }
 
@@ -508,6 +555,12 @@ export const getOrderInvoice = async (
     );
 
     if (!booking) throw new AppError("Order not found", 404);
+    if (booking.status !== "delivered") {
+      throw new AppError("Invoice is available once the order is delivered.", 400);
+    }
+    if (booking.paymentStatus !== "completed") {
+      throw new AppError("Invoice is available once payment is confirmed.", 400);
+    }
 
     const vendorDoc = await Vendor.findById(vendorId).select(
       "vendorCode name email mobile business",
@@ -648,7 +701,11 @@ export const submitQC = async (
     const booking = await findVendorBooking(vendorId, req.params.id);
     if (!booking) throw new AppError("Order not found", 404);
 
-    if (!["accepted", "confirmed", "qc_pending"].includes(booking.status)) {
+    if (
+      !["accepted", "confirmed", "qc_pending", "qc_rejected"].includes(
+        booking.status,
+      )
+    ) {
       throw new AppError(
         "QC can only be submitted on accepted orders.",
         400,
@@ -878,6 +935,12 @@ export const getVendorInvoiceHtml = async (
       .lean();
 
     if (!booking) throw new AppError("Order not found.", 404);
+    if (booking.status !== "delivered") {
+      throw new AppError("Invoice is available once the order is delivered.", 400);
+    }
+    if (booking.paymentStatus !== "completed") {
+      throw new AppError("Invoice is available once payment is confirmed.", 400);
+    }
 
     const vendor = booking.vendor || {};
     const biz = vendor.business || {};

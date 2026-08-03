@@ -13,6 +13,7 @@ import {
   getTopVendors,
   getRevenueTrend,
 } from "../controllers/booking.controller";
+import { generateInvoices, getBookingInvoices } from "../controllers/invoice.controller";
 import { authenticate } from "../middlewares/auth.middleware";
 
 const router = Router();
@@ -49,5 +50,9 @@ router.patch("/:id/driver", allocateDriver);
 
 // Delete booking (soft delete)
 router.delete("/:id", deleteBooking);
+
+// Invoices (vendor->customer + vendor->OTG back-to-back)
+router.get("/:id/invoices", getBookingInvoices);
+router.post("/:id/invoices/generate", generateInvoices);
 
 export default router;

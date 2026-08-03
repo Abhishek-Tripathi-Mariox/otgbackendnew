@@ -51,6 +51,8 @@ export const listDriverNotifications = async (
       targetType: n.targetType,
       createdAt: n.createdAt,
       sentAt: n.sentAt,
+      booking: n.booking || null,
+      image: n.image || null,
       unread: !(n.readByDrivers || []).some((id: any) => id.equals(objectId)),
     }));
 

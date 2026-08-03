@@ -4,6 +4,7 @@ import Booking, { pushStatus, isCodPaymentMethod } from "../models/Booking.model
 import Driver from "../models/Driver.model";
 import { AppError } from "../middlewares/errorHandler";
 import { DriverRequest } from "../middlewares/driverAuth.middleware";
+import { ensureInvoicesGenerated } from "../services/invoiceService";
 
 type UiStatus = "in_progress" | "delivered" | "rejected";
 
@@ -286,6 +287,13 @@ export const updateOrderStatus = async (
     }
 
     await booking.save();
+
+    // Fire-and-forget: no-ops unless this delivery just made the booking
+    // both delivered AND paid (e.g. COD payment completing right above).
+    if (booking.status === "delivered" && booking.paymentStatus === "completed") {
+      ensureInvoicesGenerated(String(booking._id)).catch(() => {});
+    }
+
     const populated = await populateBooking(Booking.findById(booking._id));
     res.json({ success: true, data: formatBooking(populated) });
   } catch (error) {

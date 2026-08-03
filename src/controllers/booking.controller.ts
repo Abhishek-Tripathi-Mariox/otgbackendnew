@@ -5,6 +5,7 @@ import Vendor from "../models/Vendor.model";
 import Driver from "../models/Driver.model";
 import { AppError } from "../middlewares/errorHandler";
 import { AuthRequest } from "../types";
+import { ensureInvoicesGenerated } from "../services/invoiceService";
 
 // Generate unique booking ID
 const generateBookingId = async (): Promise<string> => {
@@ -214,7 +215,7 @@ export const updateBookingStatus = async (
 ): Promise<void> => {
   try {
     const { id } = req.params;
-    const { status, paymentStatus } = req.body;
+    const { status, paymentStatus, note } = req.body;
 
     const booking = await Booking.findById(id);
 
@@ -229,9 +230,12 @@ export const updateBookingStatus = async (
           400,
         );
       }
+      if (status === "qc_rejected" && !String(note || "").trim()) {
+        throw new AppError("A reason is required to reject QC.", 400);
+      }
       // Route through pushStatus so statusHistory + lifecycle timestamps stay
       // consistent with the customer tracking timeline.
-      pushStatus(booking, status);
+      pushStatus(booking, status, note ? String(note).trim() : undefined);
     }
 
     if (paymentStatus) {
@@ -247,6 +251,10 @@ export const updateBookingStatus = async (
 
     booking.updatedBy = req.admin?._id as any;
     await booking.save({ validateModifiedOnly: true });
+
+    if (booking.status === "delivered" && booking.paymentStatus === "completed") {
+      ensureInvoicesGenerated(String(booking._id)).catch(() => {});
+    }
 
     const populatedBooking = await Booking.findById(booking._id)
       .populate("user", "name mobile email")

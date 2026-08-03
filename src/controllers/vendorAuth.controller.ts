@@ -653,6 +653,8 @@ export const listVendorNotifications = async (
       targetType: n.targetType,
       createdAt: n.createdAt,
       sentAt: n.sentAt,
+      booking: n.booking || null,
+      image: n.image || null,
       unread: !(n.readByVendors || []).some((id: any) => id.equals(objectId)),
     }));
 

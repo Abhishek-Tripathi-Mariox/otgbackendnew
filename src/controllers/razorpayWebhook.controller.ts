@@ -3,6 +3,7 @@ import Payment from "../models/Payment.model";
 import Booking, { pushStatus } from "../models/Booking.model";
 import { getRazorpayCreds, verifyWebhookSignature } from "../services/razorpayService";
 import { finalizeBookingsForPayment } from "./payments.controller";
+import { ensureInvoicesGenerated } from "../services/invoiceService";
 
 /**
  * POST /api/webhooks/razorpay
@@ -90,6 +91,9 @@ export const handleRazorpayWebhook = async (
               doc.paymentStatus = "completed";
               pushStatus(doc, doc.status, "Payment captured via Razorpay webhook");
               await doc.save();
+              if (doc.status === "delivered") {
+                ensureInvoicesGenerated(String(doc._id)).catch(() => {});
+              }
             }
           }
         }

@@ -21,6 +21,14 @@ export interface INotification extends Document {
   // 0/0 whenever Firebase isn't configured).
   pushSent?: number;
   pushFailed?: number;
+  // Optional link back to the order this notification is about (e.g. "new
+  // order available", "order taken", "QC rejected") — lets the driver/vendor
+  // apps navigate straight to the relevant order on tap. Absent for
+  // non-order notifications (admin broadcasts).
+  booking?: mongoose.Types.ObjectId;
+  // Optional product photo (e.g. first image of the material in a new-order
+  // notification) shown alongside the notification in the app.
+  image?: string;
   createdBy: mongoose.Types.ObjectId;
   readByVendors: mongoose.Types.ObjectId[];
   deletedByVendors: mongoose.Types.ObjectId[];
@@ -71,6 +79,8 @@ const notificationSchema = new Schema<INotification>(
     sentAt: { type: Date, default: null },
     pushSent: { type: Number, default: 0 },
     pushFailed: { type: Number, default: 0 },
+    booking: { type: Schema.Types.ObjectId, ref: "Booking", default: null },
+    image: { type: String, trim: true },
     createdBy: {
       type: Schema.Types.ObjectId,
       ref: "Admin",

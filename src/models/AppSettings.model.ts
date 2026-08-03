@@ -9,6 +9,20 @@ export interface IAppSettingsDocument extends Document {
     subtitle: string;
     buttonText: string;
   };
+  // OTG's own legal-entity details — used as the "buyer" party on the
+  // vendor->OTG back-to-back invoice.
+  companyProfile: {
+    name: string;
+    gstin: string;
+    pan: string;
+    address: string;
+    city: string;
+    state: string;
+    pincode: string;
+    bankAccountNumber: string;
+    bankIfsc: string;
+    bankName: string;
+  };
   updatedBy?: mongoose.Types.ObjectId;
   createdAt: Date;
   updatedAt: Date;
@@ -39,6 +53,18 @@ const AppSettingsSchema: Schema = new Schema(
         trim: true,
         default: "Get Bulk Quote",
       },
+    },
+    companyProfile: {
+      name: { type: String, trim: true, default: "OTG" },
+      gstin: { type: String, trim: true, default: "" },
+      pan: { type: String, trim: true, default: "" },
+      address: { type: String, trim: true, default: "" },
+      city: { type: String, trim: true, default: "" },
+      state: { type: String, trim: true, default: "" },
+      pincode: { type: String, trim: true, default: "" },
+      bankAccountNumber: { type: String, trim: true, default: "" },
+      bankIfsc: { type: String, trim: true, default: "" },
+      bankName: { type: String, trim: true, default: "" },
     },
     updatedBy: {
       type: Schema.Types.ObjectId,
