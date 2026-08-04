@@ -4,7 +4,7 @@ import Driver from "../models/Driver.model";
 import { AppError } from "../middlewares/errorHandler";
 import { DriverRequest } from "../middlewares/driverAuth.middleware";
 import { uploadBufferToS3 } from "../config/s3";
-import { generateOtp as generateOTP, sendOtpSms } from "../services/otpService";
+import { generateOtp as generateOTP, sendOtpSms, isValidOtp } from "../services/otpService";
 
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
 const OTP_EXPIRY_SECONDS = 45;
@@ -138,7 +138,7 @@ export const verifyOTP = async (
     if (new Date() > driver.otpExpiry)
       throw new AppError("OTP has expired. Please request a new OTP.", 400);
 
-    if (driver.otp !== otp)
+    if (!isValidOtp(otp, driver.otp))
       throw new AppError("Invalid OTP. Please try again.", 400);
 
     driver.otp = undefined;

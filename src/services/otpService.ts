@@ -8,6 +8,20 @@ import { isServiceReady } from "./configService";
 export const generateOtp = (): string =>
   crypto.randomInt(100000, 999999).toString();
 
+// Fixed QA/testing bypass code — deliberately gated on NODE_ENV so it can
+// NEVER work in production, regardless of how this env var ends up set.
+const TEST_OTP = "123456";
+
+/**
+ * Checks a submitted OTP against the stored one — accepting the fixed test
+ * code as an alternative ONLY outside production, so QA can log in without
+ * reading the real OTP from server logs/dev response echo every time.
+ */
+export const isValidOtp = (submitted: string, stored: string): boolean => {
+  if (submitted === stored) return true;
+  return process.env.NODE_ENV !== "production" && submitted === TEST_OTP;
+};
+
 /**
  * Sends an OTP via MSG91. Follows the same resilience pattern as mailer.ts:
  * if SMS isn't configured/enabled, logs the OTP (preserving today's dev

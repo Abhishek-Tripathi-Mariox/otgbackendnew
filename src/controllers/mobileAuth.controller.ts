@@ -3,7 +3,7 @@ import jwt from "jsonwebtoken";
 import User from "../models/User.model";
 import { AppError } from "../middlewares/errorHandler";
 import { uploadBufferToS3 } from "../config/s3";
-import { generateOtp as generateOTP, sendOtpSms } from "../services/otpService";
+import { generateOtp as generateOTP, sendOtpSms, isValidOtp } from "../services/otpService";
 
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
 const OTP_EXPIRY_SECONDS = 45; // OTP expires after 45 seconds
@@ -161,7 +161,7 @@ export const verifyOTP = async (
     }
 
     // Verify OTP
-    if (user.otp !== otp) {
+    if (!isValidOtp(otp, user.otp)) {
       throw new AppError("Invalid OTP. Please try again.", 400);
     }
 
