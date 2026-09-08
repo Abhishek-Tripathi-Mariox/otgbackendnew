@@ -97,13 +97,24 @@ export const searchAddress = async (query: string): Promise<GeocodeSearchResult[
         params: { query: `${query}, India`, key: googleKey },
         timeout: 8000,
       });
-      const results = res.data?.results || [];
-      return results.map((r: any) => ({
-        place_id: r.place_id,
-        display_name: r.formatted_address || r.name,
-        lat: String(r.geometry?.location?.lat ?? ""),
-        lon: String(r.geometry?.location?.lng ?? ""),
-      }));
+      // Google returns HTTP 200 even for failures (bad key, billing not
+      // enabled, quota exceeded, API not enabled for this key) — the real
+      // outcome is in the body's `status` field, not the HTTP status.
+      // "ZERO_RESULTS" is a legitimate empty result, not a failure.
+      if (res.data?.status !== "OK" && res.data?.status !== "ZERO_RESULTS") {
+        console.error(
+          `[mapsService] Google Places search rejected (status: ${res.data?.status}):`,
+          res.data?.error_message || res.data,
+        );
+      } else {
+        const results = res.data?.results || [];
+        return results.map((r: any) => ({
+          place_id: r.place_id,
+          display_name: r.formatted_address || r.name,
+          lat: String(r.geometry?.location?.lat ?? ""),
+          lon: String(r.geometry?.location?.lng ?? ""),
+        }));
+      }
     } catch (error) {
       console.error("[mapsService] Google Places search failed, falling back to OSM:", error);
     }
@@ -133,12 +144,21 @@ export const reverseGeocode = async (
         params: { latlng: `${lat},${lon}`, key: googleKey },
         timeout: 8000,
       });
-      const result = res.data?.results?.[0];
-      if (result) {
-        return {
-          display_name: result.formatted_address || "",
-          address: googleComponentsToAddress(result.address_components || []),
-        };
+      // Same body-level `status` check as searchAddress above — HTTP 200
+      // does not mean Google actually geocoded anything.
+      if (res.data?.status !== "OK") {
+        console.error(
+          `[mapsService] Google reverse geocode rejected (status: ${res.data?.status}):`,
+          res.data?.error_message || res.data,
+        );
+      } else {
+        const result = res.data?.results?.[0];
+        if (result) {
+          return {
+            display_name: result.formatted_address || "",
+            address: googleComponentsToAddress(result.address_components || []),
+          };
+        }
       }
     } catch (error) {
       console.error("[mapsService] Google reverse geocode failed, falling back to OSM:", error);

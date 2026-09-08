@@ -28,6 +28,7 @@
     "express": "^4.21.0",
     "express-rate-limit": "^8.6.0",
     "express-validator": "^7.2.0",
+    "firebase-admin": "^13.10.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.6.0",
     "multer": "^2.0.2",

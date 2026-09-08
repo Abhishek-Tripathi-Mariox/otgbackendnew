@@ -33,7 +33,10 @@ export const sendOtpSms = async (
   mobile: string,
   otp: string,
 ): Promise<boolean> => {
-  const creds = await isServiceReady("sms", ["apiKey", "senderId", "templateId"]);
+  // senderId is intentionally not required here — with the /v5/flow API the
+  // sender is baked into the DLT template registration itself, not passed
+  // as a request param (kept in the admin config only for reference/labeling).
+  const creds = await isServiceReady("sms", ["apiKey", "templateId"]);
 
   if (!creds) {
     // Only echo the actual OTP to the console in dev — logging real OTPs in
@@ -49,25 +52,72 @@ export const sendOtpSms = async (
   }
 
   try {
-    const fullMobile = mobile.startsWith("91") ? mobile : `91${mobile}`;
+    // MSG91 expects mobile as concatenated digits only (e.g. "919999999999").
+    const cc = "91";
+    const num = mobile.replace(/\D/g, "").replace(/^91/, "");
+    const fullMobile = `${cc}${num}`;
+    const templateId = creds.templateId.trim();
+    const apiKey = creds.apiKey.trim();
 
-    await axios.post(
-      "https://control.msg91.com/api/v5/otp",
+    // Use the Flow/Send-SMS API (/v5/flow), not the dedicated /v5/otp
+    // endpoint. MSG91's /v5/otp endpoint requires the template to be
+    // registered under MSG91's separate "OTP" template category; a normal
+    // DLT-verified SMS template (the common case) only works via /v5/flow,
+    // with the OTP passed positionally as VAR1. Posting a /v5/otp-category
+    // template_id to /v5/otp can return `type:"success"` (MSG91 accepts the
+    // API call) while the carrier silently drops the message, since the
+    // template isn't actually linked for that flow — sender ID is baked
+    // into the template registration itself, not passed as a param here.
+    const res = await axios.post(
+      "https://control.msg91.com/api/v5/flow",
       {
-        mobile: fullMobile,
-        otp,
-        template_id: creds.templateId,
-        sender: creds.senderId,
+        template_id: templateId,
+        short_url: "0",
+        // MSG91 ignores recipient keys that don't match the DLT-approved
+        // template's actual variable name — sending every common naming
+        // convention at once (VAR1/var1/VAR2/OTP/var/otp) costs nothing and
+        // maximizes the odds of matching whatever this specific template was
+        // registered with, without needing to know the exact name in advance.
+        recipients: [
+          {
+            mobiles: fullMobile,
+            VAR1: otp,
+            var1: otp,
+            VAR2: otp,
+            OTP: otp,
+            var: otp,
+            otp,
+          },
+        ],
       },
       {
-        headers: { authkey: creds.apiKey },
+        headers: {
+          accept: "application/json",
+          authkey: apiKey,
+          "content-type": "application/json",
+        },
         timeout: 10000,
       },
     );
 
+    // MSG91 returns HTTP 200 even for some logical failures — the real
+    // outcome is in the body's `type` field.
+    if (res.data?.type !== "success") {
+      console.error(`[otpService] MSG91 rejected OTP send to ${mobile}:`, res.data);
+      return false;
+    }
+
+    console.log(
+      `[otpService] MSG91 accepted OTP for ${mobile} (request_id: ${res.data?.request_id}). ` +
+        `If it doesn't arrive, check this request_id in the MSG91 dashboard's delivery report — ` +
+        `a "success" API response only means MSG91 queued it, not that the carrier delivered it.`,
+    );
     return true;
-  } catch (error) {
-    console.error(`[otpService] Failed to send OTP via MSG91 to ${mobile}:`, error);
+  } catch (error: any) {
+    console.error(
+      `[otpService] Failed to send OTP via MSG91 to ${mobile}:`,
+      error?.response?.data || error?.message || error,
+    );
     return false;
   }
 };
