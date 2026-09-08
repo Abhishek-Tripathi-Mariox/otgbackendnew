@@ -1,12 +1,21 @@
 import { Response, NextFunction } from "express";
 import mongoose from "mongoose";
-import Quotation from "../models/Quotation.model";
+import Quotation, {
+  IQuotationDocument,
+} from "../models/Quotation.model";
 import Vendor from "../models/Vendor.model";
+import User from "../models/User.model";
+import Booking, { IBuyerDetails } from "../models/Booking.model";
+import Material from "../models/Material.model";
 import { AuthRequest } from "../types";
 import { UserRequest } from "../middlewares/userAuth.middleware";
 import { VendorRequest } from "../middlewares/vendorAuth.middleware";
 import { AppError } from "../middlewares/errorHandler";
 import { deleteFromS3 } from "../config/s3";
+import { sendMail } from "../services/mailer";
+import { sendPush } from "../services/pushService";
+import { notifyAdmin } from "../services/adminNotify";
+import { generateBookingId } from "./mobileOrders.controller";
 
 const normalizeMobile = (m: string): string =>
   String(m || "").replace(/^\+91/, "").replace(/\s+/g, "").trim();
@@ -123,6 +132,32 @@ export const createQuotation = async (
       status: "new",
     });
 
+    // Best-effort notification — the Quotations admin page today only
+    // surfaces new requests via polling, so this gives admins an immediate
+    // heads-up. Never blocks the response on mail delivery.
+    const adminEmail = process.env.ADMIN_EMAIL || "admin@otg.com";
+    sendMail({
+      to: adminEmail,
+      subject: `New bulk quotation request — ${quotation.quotationCode}`,
+      html: `
+        <p>A new quotation request has been submitted.</p>
+        <ul>
+          <li><b>Code:</b> ${quotation.quotationCode}</li>
+          <li><b>Name:</b> ${quotation.name}</li>
+          <li><b>Mobile:</b> ${quotation.mobile}</li>
+          <li><b>Type:</b> ${quotation.customerType}</li>
+          <li><b>Items:</b> ${cleanedItems.length || 1}</li>
+        </ul>
+        <p>Please review and respond in the admin panel.</p>
+      `,
+    }).catch(() => {});
+
+    notifyAdmin({
+      title: "New bulk quotation request",
+      message: `${quotation.name} (${quotation.mobile}) submitted a new quotation request — ${quotation.quotationCode}.`,
+      createdBy: quotation.user || undefined,
+    }).catch(() => {});
+
     res.status(201).json({
       success: true,
       message: "Quotation request submitted successfully",
@@ -166,6 +201,97 @@ export const getMyQuotation = async (
   }
 };
 
+/**
+ * Auto-generates one Booking per quotation line item that has a resolvable
+ * catalog materialId, when a bulk quotation is accepted. Admin only ever
+ * negotiates a single lump-sum `quotedPrice` for the whole quotation — there
+ * is no per-item pricing anywhere in the admin UI — so each item's price is
+ * derived as a flat per-unit rate (quotedPrice / total quantity across all
+ * items), which reconstructs exactly back to the agreed lump sum when every
+ * item is bookable. Items without a materialId (free-text/category-only
+ * requests) can't become a Booking (Booking.material is a required catalog
+ * reference) and are silently skipped — admin must handle those manually.
+ * Never throws — quotation acceptance must never be blocked by this.
+ */
+const generateBookingsFromQuotation = async (
+  quotation: IQuotationDocument,
+): Promise<void> => {
+  try {
+    if (!quotation.user) return; // guest quotation — no account to attach bookings to
+    if (await Booking.exists({ quotationRef: quotation._id })) return; // already generated
+
+    const lumpSum = Number(quotation.quotedPrice);
+    if (!Number.isFinite(lumpSum) || lumpSum <= 0) return;
+    if (!Array.isArray(quotation.items) || quotation.items.length === 0) return;
+
+    const parseQty = (raw?: string): number => {
+      const n = parseFloat(String(raw ?? "").replace(/[^0-9.]/g, ""));
+      return Number.isFinite(n) && n > 0 ? n : 1;
+    };
+
+    const totalQty = quotation.items.reduce(
+      (sum, it) => sum + parseQty(it.quantity),
+      0,
+    );
+    if (totalQty <= 0) return;
+    const unitRate = lumpSum / totalQty;
+
+    const buyerDetails: Partial<IBuyerDetails> = {
+      accountType: quotation.customerType === "individual" ? "individual" : "company",
+      name: quotation.name,
+      mobile: quotation.mobile,
+      email: quotation.email,
+      deliveryAddress: quotation.address || "",
+      landmark: quotation.landmark,
+      companyName: quotation.company,
+    };
+
+    for (const item of quotation.items) {
+      if (!item.materialId) continue;
+      try {
+        const material = await Material.findById(item.materialId)
+          .select("unit")
+          .lean();
+        if (!material) continue;
+
+        const qty = parseQty(item.quantity);
+        const price = +unitRate.toFixed(2);
+        const totalAmount = +(price * qty).toFixed(2);
+        const bookingId = await generateBookingId();
+
+        await Booking.create({
+          bookingId,
+          user: quotation.user,
+          vendor: quotation.assignedVendor || undefined,
+          material: item.materialId,
+          quantity: qty,
+          unit: item.unit || (material as any).unit || "unit",
+          price,
+          totalAmount,
+          site: quotation.address,
+          buyerDetails,
+          quotationRef: quotation._id,
+          paymentGateway: "manual",
+          paymentStatus: "pending",
+          notes: `Auto-generated from accepted bulk quotation ${quotation.quotationCode}.`,
+          createdBy: quotation.user,
+          statusHistory: [{ status: "pending", at: new Date() }],
+        });
+      } catch (itemError) {
+        console.error(
+          `[quotation] Failed to auto-generate booking for item (material ${item.materialId}) on quotation ${quotation.quotationCode}:`,
+          itemError,
+        );
+      }
+    }
+  } catch (error) {
+    console.error(
+      "[quotation] Failed to auto-generate bookings on acceptance:",
+      error,
+    );
+  }
+};
+
 // Customer accepts or rejects a quote the admin has sent back
 export const setMyQuotationStatus = async (
   req: UserRequest,
@@ -195,6 +321,10 @@ export const setMyQuotationStatus = async (
 
     quotation.status = status;
     await quotation.save();
+
+    if (status === "accepted") {
+      await generateBookingsFromQuotation(quotation);
+    }
 
     res.json({
       success: true,
@@ -306,11 +436,34 @@ export const respondToQuotation = async (
     }
     if (quotedValidTill) quotation.quotedValidTill = new Date(quotedValidTill);
     if (adminNotes !== undefined) quotation.adminNotes = adminNotes;
+    // A response to an already-quoted request is a revision, not a first
+    // send — the buyer-facing push wording differs accordingly.
+    const isRevision = quotation.status === "quoted";
     quotation.status = "quoted";
     quotation.respondedBy = new mongoose.Types.ObjectId(req.admin!._id);
     quotation.respondedAt = new Date();
 
     await quotation.save();
+
+    // Buyer-facing notification — no in-app inbox exists for customers yet
+    // (unlike vendor/driver), so this pushes directly to their device, the
+    // same way B1 pushes a driver on dispatch.
+    if (quotation.user) {
+      User.findById(quotation.user)
+        .select("deviceInfo.fcmToken")
+        .lean()
+        .then((user) => {
+          const token = user?.deviceInfo?.fcmToken;
+          if (!token) return;
+          return sendPush(
+            [token],
+            isRevision ? "Quotation revised" : "Quotation received",
+            `Your bulk quotation ${quotation.quotationCode} has been ${isRevision ? "revised" : "quoted"} — tap to view.`,
+            { quotationId: String(quotation._id) },
+          );
+        })
+        .catch(() => {});
+    }
 
     res.json({
       success: true,
@@ -385,6 +538,10 @@ export const updateQuotationStatus = async (
     }
     await quotation.save();
 
+    if (status === "accepted") {
+      await generateBookingsFromQuotation(quotation);
+    }
+
     res.json({
       success: true,
       message: `Quotation marked as ${status}`,
@@ -418,7 +575,10 @@ export const assignVendorToQuotation = async (
 ): Promise<void> => {
   try {
     const { id } = req.params;
-    const { vendorId } = req.body as { vendorId?: string | null };
+    const { vendorId, vendorRate } = req.body as {
+      vendorId?: string | null;
+      vendorRate?: number | string | null;
+    };
 
     const quotation = await Quotation.findById(id);
     if (!quotation) throw new AppError("Quotation not found", 404);
@@ -432,13 +592,44 @@ export const assignVendorToQuotation = async (
       if (!vendor) {
         throw new AppError("Vendor not found or inactive", 400);
       }
+
+      // Reassigning to a different vendor (or actually changing the rate)
+      // resets the PO's own accept state — the vendor must acknowledge the
+      // (possibly new) rate again. A no-op re-save (same vendor, same rate)
+      // must NOT reset an already-accepted PO back to "pending".
+      const isNewAssignment =
+        String(quotation.assignedVendor || "") !== String(vendor._id);
+      const previousRate = quotation.vendorRate ?? null;
+
       quotation.assignedVendor = vendor._id as any;
       quotation.assignedAt = new Date();
       quotation.assignedBy = new mongoose.Types.ObjectId(req.admin!._id);
+
+      if (vendorRate !== undefined && vendorRate !== null && vendorRate !== "") {
+        const num = Number(vendorRate);
+        if (!Number.isFinite(num) || num < 0) {
+          throw new AppError("Vendor rate must be a non-negative number", 400);
+        }
+        quotation.vendorRate = num;
+      }
+
+      // `quotation.vendorRate` is a schema field defaulting to `null` — once
+      // the document is loaded it's never actually `undefined`, so comparing
+      // against `previousRate` (captured before the assignment above) is the
+      // only way to detect a genuine change rather than tautologically
+      // resetting on every save.
+      const rateChanged = (quotation.vendorRate ?? null) !== previousRate;
+      if (isNewAssignment || rateChanged) {
+        quotation.vendorPoStatus = "pending";
+        quotation.vendorPoAcceptedAt = null;
+      }
     } else {
       quotation.assignedVendor = null;
       quotation.assignedAt = null;
       quotation.assignedBy = null;
+      quotation.vendorRate = null;
+      quotation.vendorPoStatus = null;
+      quotation.vendorPoAcceptedAt = null;
     }
 
     await quotation.save();
@@ -507,6 +698,43 @@ export const getVendorQuotation = async (
       throw new AppError("Quotation not found or not assigned to you", 404);
     }
     res.json({ success: true, data: quotation });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Vendor accepts the PO (their own agreed rate) for a quotation assigned to
+// them — independent of the customer's own accept/reject of `status`.
+export const acceptVendorPo = async (
+  req: VendorRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const vendorId = req.vendor?.id;
+    if (!vendorId) throw new AppError("Authentication required", 401);
+
+    const { id } = req.params;
+    const quotation = await Quotation.findOne({
+      _id: id,
+      assignedVendor: vendorId,
+    });
+    if (!quotation) {
+      throw new AppError("Quotation not found or not assigned to you", 404);
+    }
+    if (quotation.vendorRate == null) {
+      throw new AppError("No vendor rate has been set for this PO yet.", 400);
+    }
+
+    quotation.vendorPoStatus = "accepted";
+    quotation.vendorPoAcceptedAt = new Date();
+    await quotation.save();
+
+    res.json({
+      success: true,
+      message: "Purchase order accepted",
+      data: quotation,
+    });
   } catch (error) {
     next(error);
   }

@@ -59,15 +59,38 @@ export async function findNearestVendorForMaterial(
   return (nearest?._id as mongoose.Types.ObjectId) || null;
 }
 
+// True when at least one vehicle has a known numeric capacity insufficient
+// for `requiredWeightKg`, AND none of the driver's vehicles meet it — i.e.
+// this driver should be excluded from a capacity-matched list. A driver with
+// no numeric capacity entered on any vehicle is never excluded (capacity
+// data is opt-in — see Driver.model.ts's `liftingCapacityKg` comment).
+const isCapacityInsufficient = (
+  vehicles: Array<{ liftingCapacityKg?: number }> | undefined,
+  requiredWeightKg?: number,
+): boolean => {
+  if (!requiredWeightKg) return false;
+  const capacities = (vehicles || [])
+    .map((v) => Number(v.liftingCapacityKg) || 0)
+    .filter((n) => n > 0);
+  if (capacities.length === 0) return false;
+  return Math.max(...capacities) < requiredWeightKg;
+};
+
 /**
  * Drivers eligible for dispatch assignment: active, approved, not deleted.
  * Used both for the vendor's driver picker and for auto-assignment fallback.
+ * When `requiredWeightKg` is given (the booking being dispatched), drivers
+ * whose every vehicle has a known-insufficient capacity are excluded —
+ * automatic vehicle-capacity matching (see Driver.model.ts).
  */
-export async function findAssignableDrivers(pincode?: string): Promise<
+export async function findAssignableDrivers(
+  pincode?: string,
+  requiredWeightKg?: number,
+): Promise<
   Array<{
     _id: mongoose.Types.ObjectId;
     name?: string;
-    vehicles?: Array<{ registrationNo?: string }>;
+    vehicles?: Array<{ registrationNo?: string; liftingCapacityKg?: number }>;
   }>
 > {
   const query: any = {
@@ -81,28 +104,37 @@ export async function findAssignableDrivers(pincode?: string): Promise<
   if (pin) {
     query["address.pincode"] = new RegExp(pin);
   }
-  return Driver.find(query)
-    .select("name vehicles.registrationNo address.pincode")
+  const drivers = await Driver.find(query)
+    .select("name vehicles.registrationNo vehicles.liftingCapacityKg address.pincode")
     .sort({ updatedAt: -1 })
     .lean();
+  return drivers.filter(
+    (d: any) => !isCapacityInsufficient(d.vehicles, requiredWeightKg),
+  );
 }
 
 /**
  * Auto-pick the first eligible (active + approved) driver for a dispatch when
  * the vendor doesn't choose one explicitly. Returns the driver doc or null.
+ * Same capacity-matching exclusion as findAssignableDrivers.
  */
-export async function findFirstAvailableDriver(): Promise<{
+export async function findFirstAvailableDriver(requiredWeightKg?: number): Promise<{
   _id: mongoose.Types.ObjectId;
   name?: string;
-  vehicles?: Array<{ registrationNo?: string }>;
+  vehicles?: Array<{ registrationNo?: string; liftingCapacityKg?: number }>;
+  deviceInfo?: { fcmToken?: string };
 } | null> {
-  const driver = await Driver.findOne({
+  const candidates = await Driver.find({
     status: "active",
     approvalStatus: "approved",
     isDeleted: false,
   })
-    .select("name vehicles.registrationNo")
+    .select("name vehicles.registrationNo vehicles.liftingCapacityKg deviceInfo.fcmToken")
     .sort({ updatedAt: -1 })
+    .limit(20)
     .lean();
-  return (driver as any) || null;
+  const eligible = candidates.filter(
+    (d: any) => !isCapacityInsufficient(d.vehicles, requiredWeightKg),
+  );
+  return (eligible[0] as any) || null;
 }

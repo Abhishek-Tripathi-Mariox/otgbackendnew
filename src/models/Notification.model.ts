@@ -3,7 +3,7 @@ import mongoose, { Document, Schema } from "mongoose";
 export interface INotification extends Document {
   title: string;
   message: string;
-  targetType: "all" | "users" | "vendors" | "drivers" | "specific";
+  targetType: "all" | "users" | "vendors" | "drivers" | "specific" | "admin";
   specificRecipients: {
     users: mongoose.Types.ObjectId[];
     vendors: mongoose.Types.ObjectId[];
@@ -34,6 +34,11 @@ export interface INotification extends Document {
   deletedByVendors: mongoose.Types.ObjectId[];
   readByDrivers: mongoose.Types.ObjectId[];
   deletedByDrivers: mongoose.Types.ObjectId[];
+  // Admin-targeted notifications (targetType "admin") are a shared inbox for
+  // the whole admin panel, not per-admin — a single boolean is enough (any
+  // admin viewing the bell dropdown marks it read for everyone), unlike the
+  // per-vendor/per-driver arrays above which track many independent readers.
+  readByAdmin?: boolean;
   isDeleted: boolean;
   deletedAt: Date | null;
   deletedBy: mongoose.Types.ObjectId | null;
@@ -58,7 +63,7 @@ const notificationSchema = new Schema<INotification>(
     targetType: {
       type: String,
       required: true,
-      enum: ["all", "users", "vendors", "drivers", "specific"],
+      enum: ["all", "users", "vendors", "drivers", "specific", "admin"],
       default: "all",
     },
     specificRecipients: {
@@ -90,6 +95,7 @@ const notificationSchema = new Schema<INotification>(
     deletedByVendors: [{ type: Schema.Types.ObjectId, ref: "Vendor" }],
     readByDrivers: [{ type: Schema.Types.ObjectId, ref: "Driver" }],
     deletedByDrivers: [{ type: Schema.Types.ObjectId, ref: "Driver" }],
+    readByAdmin: { type: Boolean, default: false },
     isDeleted: { type: Boolean, default: false },
     deletedAt: { type: Date, default: null },
     deletedBy: { type: Schema.Types.ObjectId, ref: "Admin", default: null },
@@ -107,6 +113,7 @@ notificationSchema.index({ "specificRecipients.vendors": 1 });
 notificationSchema.index({ readByDrivers: 1 });
 notificationSchema.index({ deletedByDrivers: 1 });
 notificationSchema.index({ "specificRecipients.drivers": 1 });
+notificationSchema.index({ targetType: 1, readByAdmin: 1, createdAt: -1 });
 
 const Notification = mongoose.model<INotification>(
   "Notification",

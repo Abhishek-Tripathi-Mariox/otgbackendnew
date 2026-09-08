@@ -4,6 +4,7 @@ import Booking, { pushStatus } from "../models/Booking.model";
 import { getRazorpayCreds, verifyWebhookSignature } from "../services/razorpayService";
 import { finalizeBookingsForPayment } from "./payments.controller";
 import { ensureInvoicesGenerated } from "../services/invoiceService";
+import { notifyAdmin } from "../services/adminNotify";
 
 /**
  * POST /api/webhooks/razorpay
@@ -80,6 +81,12 @@ export const handleRazorpayWebhook = async (
         await payment.save();
 
         const created = await finalizeBookingsForPayment(payment);
+
+        notifyAdmin({
+          title: "Payment received",
+          message: `Razorpay payment captured for order ${payment.razorpayOrderId} (₹${payment.amount || 0}).`,
+          booking: created[0]?._id,
+        }).catch(() => {});
 
         // If the client-side /verify call already created the bookings
         // (paymentStatus already "completed"), this is a no-op audit note;

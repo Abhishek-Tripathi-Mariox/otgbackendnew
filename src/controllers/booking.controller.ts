@@ -6,6 +6,7 @@ import Driver from "../models/Driver.model";
 import { AppError } from "../middlewares/errorHandler";
 import { AuthRequest } from "../types";
 import { ensureInvoicesGenerated } from "../services/invoiceService";
+import { sendPush } from "../services/pushService";
 
 // Generate unique booking ID
 const generateBookingId = async (): Promise<string> => {
@@ -357,9 +358,30 @@ export const allocateDriver = async (
         _id: driverId,
         isDeleted: false,
         approvalStatus: "approved",
-      }).select("_id name vehicles");
+      }).select("_id name vehicles deviceInfo.fcmToken");
       if (!driver) {
         throw new AppError("Driver not found or not approved.", 400);
+      }
+
+      // Vehicle-capacity matching: block assignment when this driver's
+      // heaviest vehicle has a known capacity below what the delivery needs.
+      const material = await Material.findById(booking.material)
+        .select("weightPerUnit")
+        .lean();
+      const requiredWeightKg = material?.weightPerUnit
+        ? material.weightPerUnit * booking.quantity
+        : undefined;
+      if (requiredWeightKg) {
+        const capacities = ((driver as any).vehicles || [])
+          .map((v: any) => Number(v.liftingCapacityKg) || 0)
+          .filter((n: number) => n > 0);
+        const maxCapacity = capacities.length ? Math.max(...capacities) : 0;
+        if (maxCapacity > 0 && maxCapacity < requiredWeightKg) {
+          throw new AppError(
+            `This driver's vehicle capacity is too low for this delivery (needs at least ${requiredWeightKg}kg).`,
+            400,
+          );
+        }
       }
 
       booking.driver = driver._id as any;
@@ -390,6 +412,21 @@ export const allocateDriver = async (
 
     booking.updatedBy = req.admin?._id as any;
     await booking.save({ validateModifiedOnly: true });
+
+    if (driverId) {
+      const assignedFcmToken = await Driver.findById(driverId)
+        .select("deviceInfo.fcmToken")
+        .lean()
+        .then((d) => d?.deviceInfo?.fcmToken);
+      if (assignedFcmToken) {
+        sendPush(
+          [assignedFcmToken],
+          "New delivery assigned",
+          `Order ${booking.bookingId} has been assigned to you. Tap to view.`,
+          { bookingId: String(booking._id) },
+        ).catch(() => {});
+      }
+    }
 
     const populated = await Booking.findById(booking._id)
       .populate("user", "name mobile email")
@@ -555,6 +592,43 @@ export const getDashboardStats = async (
         },
       },
     });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get a count per exact booking status, unfiltered by any list-page status
+ * filter — the Admin Bookings page's stat cards must source counts from
+ * here, NOT from its own already-status-filtered list array. Previously
+ * they computed counts from that same filtered array, so clicking one
+ * status card narrowed the list to just that status, and every OTHER
+ * card's count then read as 0 (or changed) since the array no longer
+ * contained those bookings.
+ */
+export const getBookingStatusCounts = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const counts = await Booking.aggregate([
+      { $match: { isDeleted: false } },
+      { $group: { _id: "$status", count: { $sum: 1 } } },
+    ]);
+
+    const byStatus: Record<string, number> = {};
+    for (const c of counts) {
+      if (c._id) byStatus[c._id] = c.count;
+    }
+    // `confirmed` is the legacy alias of `accepted` — fold it in so the
+    // "Accepted" card reflects both, matching how the list itself already
+    // treats them as one status everywhere else.
+    if (byStatus.confirmed) {
+      byStatus.accepted = (byStatus.accepted || 0) + byStatus.confirmed;
+    }
+
+    res.json({ success: true, data: byStatus });
   } catch (error) {
     next(error);
   }

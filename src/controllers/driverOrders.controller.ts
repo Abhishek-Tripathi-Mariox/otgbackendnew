@@ -2,9 +2,12 @@ import { Response, NextFunction } from "express";
 import mongoose from "mongoose";
 import Booking, { pushStatus, isCodPaymentMethod } from "../models/Booking.model";
 import Driver from "../models/Driver.model";
+import Material from "../models/Material.model";
 import { AppError } from "../middlewares/errorHandler";
 import { DriverRequest } from "../middlewares/driverAuth.middleware";
 import { ensureInvoicesGenerated } from "../services/invoiceService";
+import { findMatchingDrivers, notifyDrivers } from "../services/driverNotify";
+import { notifyAdmin } from "../services/adminNotify";
 
 type UiStatus = "in_progress" | "delivered" | "rejected";
 
@@ -25,7 +28,12 @@ const OFFER_STATUSES = ["dispatched"];
 // early, unassigned offer to any driver whose registered pincode matches the
 // delivery pincode — first driver to accept claims it. The vendor's later
 // dispatch-time picker still runs independently and can reassign.
-const EARLY_OFFER_STATUSES = ["accepted", "confirmed"];
+// "packed"/"dispatched" are included here too — the only way a booking
+// reaches one of those statuses with `driver: null` is a driver rejection
+// (see the "reject" branch below), which clears the driver but leaves the
+// lifecycle status untouched so the customer's tracking timeline doesn't
+// regress; those bookings must still be re-claimable by another driver.
+const EARLY_OFFER_STATUSES = ["accepted", "confirmed", "packed", "dispatched"];
 const COMPLETED_STATUSES = ["delivered"];
 const REJECTED_STATUSES = ["cancelled"];
 
@@ -65,10 +73,13 @@ const formatBooking = (booking: any, stage?: "dispatch" | "early") => {
     quantity: booking.quantity,
     unit: booking.unit,
     isCod: isCodPaymentMethod(booking.paymentMethod),
-    codAmount:
-      isCodPaymentMethod(booking.paymentMethod) && booking.status === "delivered"
-        ? booking.totalAmount || 0
-        : 0,
+    // Shown to the driver before/during delivery too (not just after), so
+    // they know up front how much cash to collect — previously this was
+    // gated to `status === "delivered"`, making it invisible exactly when
+    // it mattered most.
+    codAmount: isCodPaymentMethod(booking.paymentMethod)
+      ? booking.totalAmount || 0
+      : 0,
     ...(stage ? { stage } : {}),
   };
 };
@@ -180,7 +191,7 @@ export const updateOrderStatus = async (
     let driverDoc: any = null;
     if (action !== "reject") {
       driverDoc = await Driver.findById(driverId).select(
-        "isOnline address.pincode",
+        "isOnline address.pincode vehicles.liftingCapacityKg",
       );
       if (!driverDoc?.isOnline) {
         throw new AppError(
@@ -203,26 +214,63 @@ export const updateOrderStatus = async (
     if (!booking && action === "accept") {
       const pin = driverPincode(driverDoc);
       if (pin) {
-        booking = await Booking.findOneAndUpdate(
-          {
-            bookingId,
-            driver: null,
-            isDeleted: false,
-            status: { $in: EARLY_OFFER_STATUSES },
-            pincode: new RegExp(pin),
-          },
-          {
-            $set: { driver: new mongoose.Types.ObjectId(driverId) },
-            $push: {
-              statusHistory: {
-                status: "accepted",
-                at: new Date(),
-                note: "Driver accepted (early offer)",
+        // Vehicle-capacity matching: check the target booking's required
+        // weight against this driver's own vehicles before attempting the
+        // claim — done as a read here (not baked into the atomic filter
+        // below) since it needs a Material lookup; the atomic update still
+        // re-checks driver:null/status/pincode so the claim itself stays
+        // race-safe, this just pre-empts an obviously-too-small vehicle.
+        const candidate = await Booking.findOne({
+          bookingId,
+          driver: null,
+          isDeleted: false,
+          status: { $in: EARLY_OFFER_STATUSES },
+          pincode: new RegExp(pin),
+        })
+          .select("material quantity")
+          .lean();
+
+        if (candidate) {
+          const material = await Material.findById(candidate.material)
+            .select("weightPerUnit")
+            .lean();
+          const requiredWeightKg = material?.weightPerUnit
+            ? material.weightPerUnit * candidate.quantity
+            : 0;
+          if (requiredWeightKg > 0) {
+            const capacities = (driverDoc?.vehicles || [])
+              .map((v: any) => Number(v.liftingCapacityKg) || 0)
+              .filter((n: number) => n > 0);
+            const maxCapacity = capacities.length ? Math.max(...capacities) : 0;
+            if (maxCapacity > 0 && maxCapacity < requiredWeightKg) {
+              throw new AppError(
+                `This delivery needs a vehicle capacity of at least ${requiredWeightKg}kg.`,
+                400,
+              );
+            }
+          }
+
+          booking = await Booking.findOneAndUpdate(
+            {
+              bookingId,
+              driver: null,
+              isDeleted: false,
+              status: { $in: EARLY_OFFER_STATUSES },
+              pincode: new RegExp(pin),
+            },
+            {
+              $set: { driver: new mongoose.Types.ObjectId(driverId) },
+              $push: {
+                statusHistory: {
+                  status: "accepted",
+                  at: new Date(),
+                  note: "Driver accepted (early offer)",
+                },
               },
             },
-          },
-          { new: true },
-        );
+            { new: true },
+          );
+        }
       }
       if (!booking) {
         throw new AppError("This delivery is no longer available.", 409);
@@ -263,6 +311,14 @@ export const updateOrderStatus = async (
           400,
         );
       }
+      const { podPhotoUrl } = req.body as { podPhotoUrl?: string };
+      if (!podPhotoUrl || typeof podPhotoUrl !== "string") {
+        throw new AppError(
+          "A proof-of-delivery photo is required to mark this order delivered.",
+          400,
+        );
+      }
+      booking.podPhotoUrl = podPhotoUrl;
       // pushStatus stamps deliveryDate = now on delivery.
       pushStatus(booking, "delivered", "Delivered");
       // COD cash changes hands right here — the customer's payment is now
@@ -282,11 +338,77 @@ export const updateOrderStatus = async (
           400,
         );
       }
-      pushStatus(booking, "cancelled", "Driver rejected");
+      // Reassign instead of cancelling the customer's whole order: clear the
+      // driver assignment and record the rejection, but deliberately leave
+      // `booking.status` unchanged so the customer's tracking timeline
+      // doesn't regress — EARLY_OFFER_STATUSES already includes every status
+      // this branch allows, so the booking becomes re-claimable by another
+      // pincode-matched driver the same way a fresh early offer is.
+      if (!Array.isArray(booking.rejectedByDrivers)) booking.rejectedByDrivers = [];
+      booking.rejectedByDrivers.push(new mongoose.Types.ObjectId(driverId));
+      booking.driver = null as any;
       booking.driverRejectedAt = new Date();
+      if (!Array.isArray(booking.statusHistory)) booking.statusHistory = [];
+      booking.statusHistory.push({
+        status: booking.status,
+        at: new Date(),
+        note: "Driver rejected — looking for another driver",
+      });
     }
 
     await booking.save();
+
+    if (action === "complete") {
+      notifyAdmin({
+        title: "Order delivered",
+        message: `Order ${booking.bookingId} was marked delivered.`,
+        booking: booking._id,
+      }).catch(() => {});
+    }
+
+    // Re-notify other matching drivers (or alert admin if none are
+    // available) after a rejection — fire-and-forget, never blocks the
+    // driver's own response.
+    if (action === "reject") {
+      (async () => {
+        try {
+          const pin = booking!.pincode
+            ? (String(booking!.pincode).match(/\d{6}/) || [])[0]
+            : undefined;
+          let requiredWeightKg: number | undefined;
+          const material = await Material.findById(booking!.material)
+            .select("weightPerUnit")
+            .lean();
+          if (material?.weightPerUnit) {
+            requiredWeightKg = material.weightPerUnit * booking!.quantity;
+          }
+
+          const candidates = pin
+            ? await findMatchingDrivers(pin, {
+                excludeDriverIds: booking!.rejectedByDrivers,
+                requiredWeightKg,
+              })
+            : [];
+
+          if (candidates.length > 0) {
+            await notifyDrivers(candidates, {
+              title: "New delivery available",
+              message: `A delivery is available in your area (pincode ${pin}). Accept it before another driver does.`,
+              booking: booking!._id,
+              createdBy: booking!.user,
+            });
+          } else {
+            await notifyAdmin({
+              title: "No driver available",
+              message: `Booking ${booking!.bookingId} was rejected by a driver and no other matching driver is currently available.`,
+              booking: booking!._id,
+            });
+          }
+        } catch (error) {
+          console.error("[driverOrders] Re-notify after rejection failed:", error);
+        }
+      })();
+    }
 
     // Fire-and-forget: no-ops unless this delivery just made the booking
     // both delivered AND paid (e.g. COD payment completing right above).

@@ -41,6 +41,19 @@ export const authenticate = async (
       if (staff.status !== "active") {
         throw new AppError(`Account is ${staff.status}.`, 403);
       }
+      // A later login from another device/browser overwrote
+      // currentSessionId — this token is stale, reject it (prevents
+      // multiple concurrent sessions on the same account).
+      if (
+        decoded.sessionId &&
+        staff.currentSessionId &&
+        decoded.sessionId !== staff.currentSessionId
+      ) {
+        throw new AppError(
+          "Session expired — you were logged in from another device.",
+          401,
+        );
+      }
 
       let permissions: Record<string, Record<string, boolean>> = {};
       if (staff.roleId) {
@@ -85,6 +98,16 @@ export const authenticate = async (
     }
     if (!admin.isActive) {
       throw new AppError("Account is deactivated.", 403);
+    }
+    if (
+      decoded.sessionId &&
+      admin.currentSessionId &&
+      decoded.sessionId !== admin.currentSessionId
+    ) {
+      throw new AppError(
+        "Session expired — you were logged in from another device.",
+        401,
+      );
     }
 
     const adminObj = admin.toObject();

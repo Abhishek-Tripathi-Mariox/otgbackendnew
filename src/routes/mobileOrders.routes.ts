@@ -5,6 +5,7 @@ import {
   createOrderFromCart,
   getOrderTracking,
   getOrderInvoiceHtml,
+  cancelOrder,
 } from "../controllers/mobileOrders.controller";
 import { authenticateUser } from "../middlewares/userAuth.middleware";
 
@@ -21,5 +22,6 @@ router.get("/", listMyOrders);
 router.get("/:id/tracking", getOrderTracking);
 router.get("/:id", getMyOrder);
 router.post("/", createOrderFromCart);
+router.post("/:id/cancel", cancelOrder);
 
 export default router;

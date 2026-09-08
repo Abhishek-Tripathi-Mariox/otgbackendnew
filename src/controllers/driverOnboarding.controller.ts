@@ -155,6 +155,14 @@ export const addVehicle = async (
     }
 
     const docs = buildVehicleDocs(incomingDocs, undefined);
+    // Only enforced for the first vehicle added during onboarding — a vehicle
+    // added later from "My Vehicles" isn't gating a step advance, so it's
+    // fine to save incrementally there.
+    if (driver.onboardingStep === "vehicle") {
+      requireDoc(docs?.rcBook?.url, "RC Book");
+      requireDoc(docs?.insurance?.url, "Insurance document");
+      requireDoc(docs?.pollutionCertificate?.url, "Pollution certificate");
+    }
     driver.vehicles.push({ ...payload, ...(docs ? { documents: docs } : {}) });
     if (driver.onboardingStep === "vehicle") {
       driver.onboardingStep = advanceStep(driver.onboardingStep, "vehicle");
@@ -250,6 +258,15 @@ export const saveOwner = async (
   }
 };
 
+// Required-document check enforced when a step is about to advance for the
+// first time — never trust the client's own "required" styling alone (same
+// rationale as validateBuyerDetails in mobileOrders.controller.ts).
+const requireDoc = (url: string | undefined, label: string) => {
+  if (!url) {
+    throw new AppError(`${label} is required before continuing.`, 400);
+  }
+};
+
 export const savePersonal = async (
   req: DriverRequest,
   res: Response,
@@ -305,7 +322,41 @@ export const savePersonal = async (
       }
     }
 
+    if (driver.onboardingStep === "personal") {
+      requireDoc(driver.documents?.drivingLicense?.url, "Driving license");
+      requireDoc(
+        driver.documents?.securityPhoto?.url,
+        "Your photo (for security verification)",
+      );
+    }
     driver.onboardingStep = advanceStep(driver.onboardingStep, "personal");
+    await driver.save();
+    res.json(respond(driver));
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Security selfie — driver-owned document, captured during the personal step
+// (see securityPhoto on Driver.model.ts). Mirrors saveDrivingLicense.
+export const saveSecurityPhoto = async (
+  req: DriverRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { url } = req.body;
+    if (!url || typeof url !== "string") {
+      throw new AppError("url is required", 400);
+    }
+    const driver = await loadDriver(req);
+    const existing = driver.documents?.securityPhoto;
+    driver.documents.securityPhoto = {
+      url,
+      status: existing?.status === "approved" ? "approved" : "pending",
+      rejectionReason: undefined,
+      uploadedAt: new Date(),
+    };
     await driver.save();
     res.json(respond(driver));
   } catch (error) {
@@ -389,6 +440,26 @@ export const saveBank = async (
   try {
     const driver = await loadDriver(req);
     driver.bank = { ...(driver.bank || {}), ...req.body };
+
+    // Final gate before submitting for admin review — defense in depth on
+    // top of the per-step checks above (covers e.g. a vehicle added before
+    // this validation existed, or edited to remove a doc afterward).
+    if (driver.onboardingStep === "bank") {
+      requireDoc(driver.documents?.drivingLicense?.url, "Driving license");
+      requireDoc(
+        driver.documents?.securityPhoto?.url,
+        "Your photo (for security verification)",
+      );
+      if (!driver.vehicles || driver.vehicles.length === 0) {
+        throw new AppError("At least one vehicle is required.", 400);
+      }
+      for (const v of driver.vehicles) {
+        requireDoc(v.documents?.rcBook?.url, "RC Book");
+        requireDoc(v.documents?.insurance?.url, "Insurance document");
+        requireDoc(v.documents?.pollutionCertificate?.url, "Pollution certificate");
+      }
+    }
+
     driver.onboardingStep = advanceStep(driver.onboardingStep, "bank");
     await driver.save();
     res.json(respond(driver));

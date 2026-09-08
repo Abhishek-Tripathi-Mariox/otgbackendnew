@@ -55,6 +55,14 @@ export interface IQuotationDocument extends Document {
   assignedVendor?: mongoose.Types.ObjectId | null;
   assignedAt?: Date | null;
   assignedBy?: mongoose.Types.ObjectId | null;
+  // The vendor's own agreed rate (set by admin alongside assignment) — this,
+  // not `quotedPrice` (the customer's price), is what the vendor app shows,
+  // framed as a Purchase Order. `vendorPoStatus` tracks the vendor's own
+  // accept action on it, independent of the customer's accept/reject on
+  // `status`.
+  vendorRate?: number | null;
+  vendorPoStatus?: "pending" | "accepted" | null;
+  vendorPoAcceptedAt?: Date | null;
 
   createdAt: Date;
   updatedAt: Date;
@@ -175,6 +183,13 @@ const QuotationSchema: Schema = new Schema(
       ref: "Admin",
       default: null,
     },
+    vendorRate: { type: Number, default: null },
+    vendorPoStatus: {
+      type: String,
+      enum: ["pending", "accepted"],
+      default: null,
+    },
+    vendorPoAcceptedAt: { type: Date, default: null },
   },
   { timestamps: true },
 );

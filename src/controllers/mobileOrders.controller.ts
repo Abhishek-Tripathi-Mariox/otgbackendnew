@@ -1,8 +1,11 @@
 import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
-import Booking, { isCodPaymentMethod } from "../models/Booking.model";
+import Booking, { isCodPaymentMethod, IBuyerDetails, pushStatus } from "../models/Booking.model";
 import Material from "../models/Material.model";
 import User from "../models/User.model";
+import Payment from "../models/Payment.model";
+import Transaction from "../models/Transaction.model";
+import AppSettings from "../models/AppSettings.model";
 import { AppError } from "../middlewares/errorHandler";
 import { UserRequest } from "../middlewares/userAuth.middleware";
 import {
@@ -13,13 +16,62 @@ import {
 import { recordOfferRedemption } from "./mobileOffers.controller";
 import { buildTaxInvoiceHtml } from "../utils/taxInvoiceHtml";
 import { findMatchingVendors, notifyVendors } from "../services/vendorNotify";
+import { notifyAdmin } from "../services/adminNotify";
+import { refund as refundRazorpayPayment } from "../services/razorpayService";
 
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
 
-const generateBookingId = async (): Promise<string> => {
+export const generateBookingId = async (): Promise<string> => {
   const count = await Booking.countDocuments();
   const timestamp = Date.now().toString().slice(-6);
   return `BK-${count + 1}-${timestamp}`;
+};
+
+/**
+ * Enforces the mandatory checkout-details requirement server-side — the
+ * client's CheckoutDetailsScreen already requires these fields, but a
+ * client can't be trusted (same rationale computeCartPricing already
+ * documents for pricing), so this is the real gate. Called before any
+ * Payment/Booking is created on both the direct and Razorpay checkout paths.
+ */
+export const validateBuyerDetails = (buyerDetails: unknown): IBuyerDetails => {
+  const b = buyerDetails as Partial<IBuyerDetails> | undefined;
+  if (!b || typeof b !== "object") {
+    throw new AppError("Buyer/checkout details are required.", 400);
+  }
+  if (b.accountType !== "individual" && b.accountType !== "company") {
+    throw new AppError("Buyer account type (individual/company) is required.", 400);
+  }
+
+  const requireField = (value: unknown, label: string) => {
+    if (!String(value ?? "").trim()) {
+      throw new AppError(`${label} is required.`, 400);
+    }
+  };
+
+  requireField(b.name, "Name");
+  requireField(b.mobile, "Mobile number");
+  requireField(b.city, "City");
+  requireField(b.pincode, "PIN code");
+
+  if (b.accountType === "individual") {
+    requireField(b.deliveryAddress, "Delivery address");
+  } else {
+    requireField(b.companyName, "Company name");
+    requireField(b.billingAddress, "Billing address");
+    requireField(b.registeredOfficeAddress, "Registered office address");
+    requireField(b.companyType, "Company type");
+    requireField(b.siteAddress, "Site address");
+    requireField(b.siteContactPerson, "Site contact person");
+    // `deliveryAddress` is required on the schema shape used for both types —
+    // for a company order it's the site address (same physical delivery
+    // point), so mirror it across if the client didn't send it explicitly.
+    if (!String(b.deliveryAddress ?? "").trim()) {
+      b.deliveryAddress = b.siteAddress;
+    }
+  }
+
+  return b as IBuyerDetails;
 };
 
 export interface CheckoutItem {
@@ -223,6 +275,7 @@ export const createBookingsFromPricing = async (
     paymentGateway?: "razorpay" | "cod" | "manual";
     razorpayOrderId?: string;
     paymentStatus?: "pending" | "partial" | "completed";
+    buyerDetails?: IBuyerDetails;
   },
 ): Promise<any[]> => {
   const { lines, deliveryPincode, totalDiscount, offerForRedemption } = pricing;
@@ -250,6 +303,7 @@ export const createBookingsFromPricing = async (
       paymentGateway: opts.paymentGateway,
       razorpayOrderId: opts.razorpayOrderId,
       paymentStatus: opts.paymentStatus,
+      buyerDetails: opts.buyerDetails,
       createdBy: userId,
       statusHistory: [{ status: "pending", at: new Date() }],
     });
@@ -280,6 +334,13 @@ export const createBookingsFromPricing = async (
       });
     }
   }
+
+  notifyAdmin({
+    title: "New order placed",
+    message: `${created.length} new order${created.length > 1 ? "s" : ""} placed (pincode ${deliveryPincode || "n/a"}).`,
+    booking: created[0]?._id,
+    createdBy: userId,
+  }).catch(() => {});
 
   if (offerForRedemption && totalDiscount > 0) {
     await recordOfferRedemption(
@@ -378,6 +439,112 @@ export const getMyOrder = async (
   }
 };
 
+const CANCELLABLE_STATUSES = ["pending", "accepted", "confirmed"];
+const CANCEL_WINDOW_MS = 15 * 60 * 1000;
+
+/**
+ * POST /api/mobile/orders/:id/cancel
+ * Lets a buyer self-cancel within 15 minutes of placing an order, before QC/
+ * packing starts. Per-Booking (not per-cart) — matches every other lifecycle
+ * action in this codebase (vendor accept/reject/QC/dispatch), and sidesteps
+ * "what if one cart line is already packed" entirely. Auto-refunds via
+ * Razorpay if the order was paid online; never blocks cancellation on
+ * refund success — a failed refund becomes a visible manual-follow-up note.
+ */
+export const cancelOrder = async (
+  req: UserRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) throw new AppError("Unauthorized", 401);
+
+    const { reason } = req.body as { reason?: string };
+
+    const raw = String(req.params.id || "").trim();
+    const isObjectId = /^[a-fA-F0-9]{24}$/.test(raw);
+    const orQuery: any[] = isObjectId
+      ? [{ _id: raw }, { bookingId: raw.toUpperCase() }]
+      : [{ bookingId: raw.toUpperCase() }];
+
+    const booking = await Booking.findOne({
+      user: userId,
+      isDeleted: false,
+      $or: orQuery,
+    });
+
+    if (!booking) throw new AppError("Order not found.", 404);
+
+    if (!CANCELLABLE_STATUSES.includes(booking.status)) {
+      throw new AppError(
+        "This order can no longer be cancelled — it's already being processed.",
+        400,
+      );
+    }
+    if (Date.now() - booking.createdAt.getTime() > CANCEL_WINDOW_MS) {
+      throw new AppError(
+        "This order can no longer be cancelled — the 15-minute window has passed.",
+        400,
+      );
+    }
+
+    pushStatus(booking, "cancelled", reason || "Cancelled by customer");
+
+    if (booking.paymentGateway === "razorpay" && booking.paymentStatus === "completed") {
+      const payment = booking.razorpayOrderId
+        ? await Payment.findOne({ razorpayOrderId: booking.razorpayOrderId })
+        : null;
+
+      if (payment?.razorpayPaymentId) {
+        const result = await refundRazorpayPayment(
+          payment.razorpayPaymentId,
+          booking.totalAmount,
+          { bookingId: booking.bookingId },
+        );
+
+        if (result) {
+          await Transaction.create({
+            booking: booking._id,
+            user: userId,
+            amount: booking.totalAmount,
+            currency: "INR",
+            mode: "other",
+            type: "refund",
+            status: "settled",
+            description: "Razorpay refund on customer cancellation",
+            meta: {
+              razorpayOrderId: booking.razorpayOrderId,
+              razorpayPaymentId: payment.razorpayPaymentId,
+              refundId: result.id,
+            },
+          });
+          booking.notes = `${booking.notes ? booking.notes + "\n" : ""}Refunded via Razorpay (refund id: ${result.id}).`;
+        } else {
+          console.error(
+            `[cancelOrder] Refund failed for booking ${booking.bookingId} (payment ${payment.razorpayPaymentId}) — needs manual follow-up.`,
+          );
+          booking.notes = `${booking.notes ? booking.notes + "\n" : ""}Refund pending — manual follow-up required.`;
+        }
+      }
+    }
+
+    await booking.save({ validateModifiedOnly: true });
+
+    const populated = await Booking.findById(booking._id)
+      .populate("material", "name images unit description")
+      .lean();
+
+    res.json({
+      success: true,
+      message: "Order cancelled successfully.",
+      data: populated,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 /**
  * POST /api/mobile/orders
  * Create bookings from a cart payload. One Booking per cart line item.
@@ -392,7 +559,7 @@ export const createOrderFromCart = async (
     const userId = req.user?.id;
     if (!userId) throw new AppError("Unauthorized", 401);
 
-    const { items, paymentMethod, site, notes, couponCode, pincode, gstAmounts } =
+    const { items, paymentMethod, site, notes, couponCode, pincode, gstAmounts, buyerDetails: rawBuyerDetails } =
       req.body as {
         items?: CheckoutItem[];
         paymentMethod?: string;
@@ -401,7 +568,10 @@ export const createOrderFromCart = async (
         couponCode?: string;
         pincode?: string;
         gstAmounts?: Record<string, number>;
+        buyerDetails?: unknown;
       };
+
+    const buyerDetails = validateBuyerDetails(rawBuyerDetails);
 
     const pricing = await computeCartPricing(userId, {
       items,
@@ -418,7 +588,11 @@ export const createOrderFromCart = async (
       site,
       notes,
       paymentGateway,
+      buyerDetails,
     });
+
+    // Best-effort — pre-fills the next checkout, never blocks this one.
+    User.updateOne({ _id: userId }, { $set: { checkoutProfile: buyerDetails } }).catch(() => {});
 
     res.status(201).json({
       success: true,
@@ -616,11 +790,16 @@ export const getOrderInvoiceHtml = async (
       throw new AppError("Invoice is available once payment is confirmed.", 400);
     }
 
-    const vendor = booking.vendor || {};
-    const biz = vendor.business || {};
-    const bank = vendor.bankDetails || {};
     const material = booking.material || {};
     const cust = booking.user || {};
+
+    // Buyer-facing invoice shows OTG (not the vendor) as seller of record —
+    // matches invoiceService.ts's ensureInvoicesGenerated, which persists
+    // the same "vendor_to_customer" invoice type with OTG as seller. This
+    // endpoint renders live/on-demand rather than reading that persisted
+    // record, so it needs the same company-profile source independently.
+    const settings = await AppSettings.findOne({ key: "default" }).lean();
+    const company = settings?.companyProfile || ({} as Record<string, string>);
 
     const qty = Number(booking.quantity || 0);
     const total = Number(booking.totalAmount || 0);
@@ -631,28 +810,30 @@ export const getOrderInvoiceHtml = async (
     const sgst = gstAmount / 2;
     const rate = qty ? basic / qty : basic;
     const issued = new Date(booking.createdAt).toLocaleDateString("en-IN");
-    const vendorName = biz.name || vendor.name || "OTG";
 
     const html = buildTaxInvoiceHtml({
-      sellerName: vendorName,
-      sellerAddress: biz.address,
-      sellerCity: biz.city,
-      sellerPincode: biz.pincode,
-      sellerState: biz.state,
-      sellerGstin: biz.gstNumber,
-      sellerMobile: vendor.mobile,
-      sellerEmail: vendor.email,
-      sellerPan: biz.panNumber,
-      bankAccountNumber: bank.accountNumber,
-      bankIfsc: bank.ifscCode,
-      bankName: bank.bankName,
+      sellerName: company.name || "OTG",
+      sellerAddress: company.address,
+      sellerCity: company.city,
+      sellerPincode: company.pincode,
+      sellerState: company.state,
+      sellerGstin: company.gstin,
+      sellerPan: company.pan,
+      bankAccountNumber: company.bankAccountNumber,
+      bankIfsc: company.bankIfsc,
+      bankName: company.bankName,
       invoiceNo: booking.bookingId,
       orderNo: booking.bookingId,
       issuedDate: issued,
       paymentMethod: booking.paymentMethod,
-      consigneeName: cust.name || "Customer",
-      consigneeAddress: booking.site || cust.address?.full,
-      consigneeMobile: cust.mobile,
+      // Sourced from the frozen per-order snapshot (buyerDetails) — never
+      // from a live User read, so a later profile edit can't silently
+      // rewrite a past invoice. Falls back to the live User for orders
+      // placed before this field existed.
+      consigneeName: booking.buyerDetails?.name || cust.name || "Customer",
+      consigneeAddress:
+        booking.buyerDetails?.deliveryAddress || booking.site || cust.address?.full,
+      consigneeMobile: booking.buyerDetails?.mobile || cust.mobile,
       dispatchThrough: booking.dispatch?.driverName,
       vehicleNumber: booking.dispatch?.vehicleNumber,
       materialName: material.name || "",

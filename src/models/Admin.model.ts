@@ -36,6 +36,15 @@ const AdminSchema: Schema = new Schema(
       type: Boolean,
       default: true,
     },
+    // Set on every successful login, embedded in the issued JWT, and
+    // compared on every authenticated request (auth.middleware.ts) — a
+    // login from a new device/browser overwrites this, which invalidates
+    // every previously-issued token for the account (multiple concurrent
+    // logins is exactly the client-reported bug this closes).
+    currentSessionId: {
+      type: String,
+      default: null,
+    },
   },
   {
     timestamps: true,

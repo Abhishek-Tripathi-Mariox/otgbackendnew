@@ -9,6 +9,7 @@ import {
   allocateDriver,
   deleteBooking,
   getDashboardStats,
+  getBookingStatusCounts,
   getTopMaterials,
   getTopVendors,
   getRevenueTrend,
@@ -23,6 +24,7 @@ router.use(authenticate);
 
 // Dashboard statistics
 router.get("/stats/dashboard", getDashboardStats);
+router.get("/stats/status-counts", getBookingStatusCounts);
 router.get("/stats/revenue-trend", getRevenueTrend);
 router.get("/stats/top-materials", getTopMaterials);
 router.get("/stats/top-vendors", getTopVendors);

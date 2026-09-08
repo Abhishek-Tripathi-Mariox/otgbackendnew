@@ -74,6 +74,13 @@ export interface IDriverModel extends Document {
     color?: string;
     year?: string;
     liftingCapacity?: string;
+    // Structured kg value used for automatic capacity matching against a
+    // booking's required weight (see Material.weightPerUnit). Kept alongside
+    // the free-text `liftingCapacity` display field rather than replacing it,
+    // so existing drivers who only ever entered a free-text value aren't
+    // broken — matching simply treats a missing liftingCapacityKg as "no
+    // restriction" until the driver fills it in.
+    liftingCapacityKg?: number;
     registrationNo?: string;
     insuranceNo?: string;
     insuranceExpiry?: Date;
@@ -103,6 +110,10 @@ export interface IDriverModel extends Document {
 
   documents: {
     drivingLicense: IDriverDocument;
+    // A live selfie captured during onboarding (distinct from `profileImage`,
+    // which is optional and settable any time after approval) — required
+    // before approval, for rider identity/security verification.
+    securityPhoto: IDriverDocument;
   };
 
   approvalStatus: ApprovalStatus;
@@ -188,6 +199,7 @@ const DriverSchema: Schema = new Schema(
             color: { type: String, trim: true },
             year: { type: String, trim: true },
             liftingCapacity: { type: String, trim: true },
+            liftingCapacityKg: { type: Number, min: 0, default: null },
             registrationNo: { type: String, trim: true, uppercase: true },
             insuranceNo: { type: String, trim: true },
             insuranceExpiry: { type: Date },
@@ -223,6 +235,7 @@ const DriverSchema: Schema = new Schema(
 
     documents: {
       drivingLicense: { type: DocumentSubSchema, default: () => ({}) },
+      securityPhoto: { type: DocumentSubSchema, default: () => ({}) },
     },
 
     approvalStatus: {

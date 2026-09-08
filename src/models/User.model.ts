@@ -1,4 +1,5 @@
 import mongoose, { Schema, Document } from "mongoose";
+import { IBuyerDetails, buyerDetailsSchemaFields } from "./Booking.model";
 
 export interface IUserDocument extends Document {
   name?: string;
@@ -26,6 +27,10 @@ export interface IUserDocument extends Document {
     lng?: number;
     isDefault?: boolean;
   }>;
+  // Saved checkout profile (individual or company) — pre-fills the mandatory
+  // checkout-details form on future orders. Not itself required; each
+  // checkout still snapshots a fresh, required IBuyerDetails onto the Booking.
+  checkoutProfile?: Partial<IBuyerDetails>;
   status: "active" | "inactive" | "blocked";
   isVerified: boolean;
   deviceInfo?: {
@@ -116,6 +121,7 @@ const UserSchema: Schema = new Schema(
       ],
       default: [],
     },
+    checkoutProfile: buyerDetailsSchemaFields,
     status: {
       type: String,
       enum: ["active", "inactive", "blocked"],

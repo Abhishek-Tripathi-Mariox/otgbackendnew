@@ -694,7 +694,7 @@ export const getUnits = async (
 ): Promise<void> => {
   try {
     const units = [
-      "Pieces",
+      "Numbers",
       "Kg",
       "Gram",
       "Meter",

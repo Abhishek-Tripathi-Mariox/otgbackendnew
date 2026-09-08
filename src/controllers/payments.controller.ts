@@ -2,6 +2,8 @@ import { Response, NextFunction } from "express";
 import { IPaymentDocument } from "../models/Payment.model";
 import Payment from "../models/Payment.model";
 import Transaction from "../models/Transaction.model";
+import User from "../models/User.model";
+import { IBuyerDetails } from "../models/Booking.model";
 import { AppError } from "../middlewares/errorHandler";
 import { UserRequest } from "../middlewares/userAuth.middleware";
 import { AuthRequest } from "../types";
@@ -9,6 +11,7 @@ import {
   CheckoutItem,
   computeCartPricing,
   createBookingsFromPricing,
+  validateBuyerDetails,
 } from "./mobileOrders.controller";
 import {
   createOrder,
@@ -24,6 +27,7 @@ interface CartSnapshot {
   pincode?: string;
   couponCode?: string;
   paymentMethod?: string;
+  buyerDetails?: IBuyerDetails;
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -85,10 +89,18 @@ export const finalizeBookingsForPayment = async (
       paymentGateway: "razorpay",
       razorpayOrderId: payment.razorpayOrderId,
       paymentStatus: "completed",
+      buyerDetails: snapshot.buyerDetails,
     });
 
     payment.bookings = created.map((b: any) => b._id);
     await payment.save();
+
+    if (snapshot.buyerDetails) {
+      // Best-effort — pre-fills the next checkout, never blocks this one.
+      User.updateOne({ _id: userId }, { $set: { checkoutProfile: snapshot.buyerDetails } }).catch(
+        () => {},
+      );
+    }
 
     for (const booking of created) {
       await Transaction.create({
@@ -132,8 +144,10 @@ export const createRazorpayOrder = async (
     const userId = req.user?.id;
     if (!userId) throw new AppError("Unauthorized", 401);
 
-    const { items, site, notes, pincode, couponCode, gstAmounts, paymentMethod } =
+    const { items, site, notes, pincode, couponCode, gstAmounts, paymentMethod, buyerDetails: rawBuyerDetails } =
       req.body as CartSnapshot;
+
+    const buyerDetails = validateBuyerDetails(rawBuyerDetails);
 
     const pricing = await computeCartPricing(userId, {
       items,
@@ -167,7 +181,7 @@ export const createRazorpayOrder = async (
       amount: pricing.grandTotal,
       currency: order.currency,
       status: "created",
-      cartSnapshot: { items, gstAmounts, site, notes, pincode, couponCode, paymentMethod },
+      cartSnapshot: { items, gstAmounts, site, notes, pincode, couponCode, paymentMethod, buyerDetails },
       attempts: [{ at: new Date(), event: "order_created", payload: order }],
     });
 

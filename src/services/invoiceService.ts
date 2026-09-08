@@ -31,7 +31,7 @@ export const ensureInvoicesGenerated = async (
     const bank = vendor.bankDetails || {};
     const cust = booking.user || {};
 
-    const sellerSnapshot = {
+    const vendorSnapshot = {
       name: biz.name || vendor.name || "Vendor",
       address: biz.address || "",
       city: biz.city || "",
@@ -48,25 +48,41 @@ export const ensureInvoicesGenerated = async (
 
     const settings = await AppSettings.findOne({ key: "default" }).lean();
     const company = settings?.companyProfile || ({} as Record<string, string>);
+    const companySnapshot = {
+      name: company.name || "OTG",
+      address: company.address || "",
+      city: company.city || "",
+      state: company.state || "",
+      pincode: company.pincode || "",
+      gstin: company.gstin || "",
+      pan: company.pan || "",
+      bankAccountNumber: company.bankAccountNumber || "",
+      bankIfsc: company.bankIfsc || "",
+      bankName: company.bankName || "",
+    };
 
+    // The "vendor_to_customer" type key is legacy naming — in substance this
+    // is now the buyer-facing invoice with OTG (not the vendor) as seller of
+    // record, matching a marketplace where the vendor is a backend supplier
+    // the customer never sees. "vendor_to_otg" (the procurement invoice) is
+    // unchanged: vendor sells to OTG at the vendor's own rate.
+    const sellerSnapshots: Record<InvoiceType, Record<string, unknown>> = {
+      vendor_to_customer: companySnapshot,
+      vendor_to_otg: vendorSnapshot,
+    };
+
+    // Source the customer-facing buyer snapshot from the frozen per-order
+    // buyerDetails, not a live User read — matches getOrderInvoiceHtml's
+    // rationale (a later profile edit must never rewrite a past invoice).
+    // Falls back to the live User for orders placed before this field existed.
+    const buyer = booking.buyerDetails || {};
     const buyerSnapshots: Record<InvoiceType, Record<string, unknown>> = {
       vendor_to_customer: {
-        name: cust.name || "Customer",
-        address: booking.site || cust.address?.full || "",
-        mobile: cust.mobile || "",
+        name: buyer.name || cust.name || "Customer",
+        address: buyer.deliveryAddress || booking.site || cust.address?.full || "",
+        mobile: buyer.mobile || cust.mobile || "",
       },
-      vendor_to_otg: {
-        name: company.name || "OTG",
-        address: company.address || "",
-        city: company.city || "",
-        state: company.state || "",
-        pincode: company.pincode || "",
-        gstin: company.gstin || "",
-        pan: company.pan || "",
-        bankAccountNumber: company.bankAccountNumber || "",
-        bankIfsc: company.bankIfsc || "",
-        bankName: company.bankName || "",
-      },
+      vendor_to_otg: companySnapshot,
     };
 
     const created: IInvoiceDocument[] = [];
@@ -79,7 +95,7 @@ export const ensureInvoicesGenerated = async (
       const invoice = await Invoice.create({
         type,
         booking: booking._id,
-        sellerSnapshot,
+        sellerSnapshot: sellerSnapshots[type],
         buyerSnapshot: buyerSnapshots[type],
         amount: booking.totalAmount,
         generatedBy: "auto",

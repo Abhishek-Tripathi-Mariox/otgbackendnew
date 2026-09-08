@@ -5,7 +5,7 @@ import { AuthRequest } from "../types";
 import { AppError } from "../middlewares/errorHandler";
 
 // Driver-owned document keys (lives on driver.documents)
-const DRIVER_DOCUMENT_KEYS = ["drivingLicense"] as const;
+const DRIVER_DOCUMENT_KEYS = ["drivingLicense", "securityPhoto"] as const;
 type DriverDocumentKey = (typeof DRIVER_DOCUMENT_KEYS)[number];
 const isDriverDocumentKey = (value: string): value is DriverDocumentKey =>
   (DRIVER_DOCUMENT_KEYS as readonly string[]).includes(value);
@@ -361,6 +361,41 @@ export const approveDriver = async (
     if (!driver) throw new AppError("Driver not found", 404);
     if (driver.isDeleted)
       throw new AppError("Cannot approve a deleted driver", 400);
+
+    // Never approve a driver missing a required document — the app-side
+    // onboarding flow already blocks submission without these, but that's
+    // client-enforceable-only; this is the real gate (same rationale as the
+    // per-step checks in driverOnboarding.controller.ts).
+    if (!driver.documents?.drivingLicense?.url) {
+      throw new AppError(
+        "Cannot approve: driving license has not been uploaded.",
+        400,
+      );
+    }
+    if (!driver.documents?.securityPhoto?.url) {
+      throw new AppError(
+        "Cannot approve: security photo has not been uploaded.",
+        400,
+      );
+    }
+    if (!driver.vehicles || driver.vehicles.length === 0) {
+      throw new AppError(
+        "Cannot approve: driver has no registered vehicle.",
+        400,
+      );
+    }
+    for (const v of driver.vehicles) {
+      if (
+        !v.documents?.rcBook?.url ||
+        !v.documents?.insurance?.url ||
+        !v.documents?.pollutionCertificate?.url
+      ) {
+        throw new AppError(
+          `Cannot approve: vehicle ${v.registrationNo || ""} is missing required documents (RC/insurance/pollution certificate).`,
+          400,
+        );
+      }
+    }
 
     driver.approvalStatus = "approved";
     driver.approvedAt = new Date();

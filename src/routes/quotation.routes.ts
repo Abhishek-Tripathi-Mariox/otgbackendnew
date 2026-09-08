@@ -11,6 +11,7 @@ import {
   assignVendorToQuotation,
   listVendorQuotations,
   getVendorQuotation,
+  acceptVendorPo,
   deleteQuotation,
   quotationCounts,
   uploadQuotationPdf,
@@ -44,6 +45,11 @@ router.patch("/me/:id/status", authenticateUser, setMyQuotationStatus);
 // ===== Vendor routes (assigned quotations) =====
 router.get("/vendor/assigned", authenticateVendor, listVendorQuotations);
 router.get("/vendor/assigned/:id", authenticateVendor, getVendorQuotation);
+router.post(
+  "/vendor/assigned/:id/accept-po",
+  authenticateVendor,
+  acceptVendorPo,
+);
 
 // ===== Admin routes =====
 router.get("/", authenticate, listQuotations);

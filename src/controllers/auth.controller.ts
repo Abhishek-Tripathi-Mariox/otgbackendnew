@@ -1,4 +1,5 @@
 import { Request, Response, NextFunction } from "express";
+import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import Admin from "../models/Admin.model";
@@ -42,11 +43,19 @@ export const login = async (
         throw new AppError("Invalid credentials.", 401);
       }
 
+      // Overwrites whatever session id a prior login on another
+      // device/browser set — that earlier token's sessionId claim no
+      // longer matches, so authenticate() rejects it on its next request.
+      const sessionId = crypto.randomUUID();
+      admin.currentSessionId = sessionId;
+      await admin.save({ validateModifiedOnly: true });
+
       const token = generateToken({
         id: admin._id.toString(),
         email: admin.email,
         role: admin.role,
         userType: "admin",
+        sessionId,
       });
 
       res.json({
@@ -97,7 +106,9 @@ export const login = async (
       }
     }
 
+    const sessionId = crypto.randomUUID();
     staff.lastLogin = new Date();
+    staff.currentSessionId = sessionId;
     await staff.save();
 
     const token = generateToken({
@@ -105,6 +116,7 @@ export const login = async (
       email: staff.email,
       role: staff.role,
       userType: "staff",
+      sessionId,
     });
 
     res.json({
@@ -125,6 +137,29 @@ export const login = async (
         },
       },
     });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Explicit sign-out — clears currentSessionId so the token this request
+// carried (and any other still-outstanding one) is rejected on its next use.
+// Previously there was no way to invalidate a session server-side at all.
+export const logout = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      throw new AppError("Not authenticated.", 401);
+    }
+    if (req.user.userType === "staff") {
+      await Staff.findByIdAndUpdate(req.user._id, { currentSessionId: null });
+    } else {
+      await Admin.findByIdAndUpdate(req.user._id, { currentSessionId: null });
+    }
+    res.json({ success: true, message: "Logged out successfully" });
   } catch (error) {
     next(error);
   }

@@ -11,6 +11,7 @@ export interface IStaffDocument extends Document {
   department: string;
   status: "active" | "inactive" | "blocked";
   lastLogin: Date | null;
+  currentSessionId: string | null;
   isDeleted: boolean;
   deletedAt: Date | null;
   createdAt: Date;
@@ -69,6 +70,10 @@ const StaffSchema: Schema = new Schema(
     },
     lastLogin: {
       type: Date,
+      default: null,
+    },
+    currentSessionId: {
+      type: String,
       default: null,
     },
     isDeleted: {

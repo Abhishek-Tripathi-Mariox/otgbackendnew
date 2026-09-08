@@ -4,6 +4,7 @@ import mongoose from "mongoose";
 import Booking, { pushStatus } from "../models/Booking.model";
 import Vendor from "../models/Vendor.model";
 import Driver from "../models/Driver.model";
+import Material from "../models/Material.model";
 import { AppError } from "../middlewares/errorHandler";
 import { VendorRequest } from "../middlewares/vendorAuth.middleware";
 import {
@@ -13,6 +14,8 @@ import {
 import { uploadBufferToS3 } from "../config/s3";
 import { buildTaxInvoiceHtml } from "../utils/taxInvoiceHtml";
 import { findMatchingVendors, notifyVendors } from "../services/vendorNotify";
+import { sendPush } from "../services/pushService";
+import { notifyAdmin } from "../services/adminNotify";
 
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
 
@@ -34,7 +37,11 @@ type UiStatus =
   | "Dispatched"
   | "In Transit"
   | "Delivered"
-  | "Cancelled";
+  | "Cancelled"
+  // Dashboard-tile-only filters — not a single raw status (see listMyOrders).
+  | "In Progress"
+  | "Today's Dispatch"
+  | "Ready for Dispatch";
 
 // Map each real booking status to the label the vendor UI shows. `confirmed`
 // is the legacy alias of `accepted`.
@@ -65,6 +72,15 @@ const UI_TO_RAW: Partial<Record<UiStatus, string[]>> = {
   "In Transit": ["in_transit"],
   Delivered: ["delivered"],
   Cancelled: ["cancelled"],
+  // Matches the Dashboard's own "In Progress" stat card definition
+  // (vendorAuth.controller.ts's IN_PROGRESS_STATUSES) — accepted work not
+  // yet dispatched.
+  "In Progress": ["accepted", "confirmed", "qc_pending", "qc_approved", "packed"],
+  // Matches the Dashboard's "Ready for Dispatch" Operations Snapshot row.
+  "Ready for Dispatch": ["qc_approved", "packed"],
+  // "Today's Dispatch" also needs a same-day date filter — handled specially
+  // in listMyOrders below, this entry just supplies the status half.
+  "Today's Dispatch": ["dispatched"],
 };
 
 const formatDate = (d?: Date | string | null): string => {
@@ -182,6 +198,13 @@ export const listMyOrders = async (
         rawList = list;
         assigned.status = { $in: list };
       }
+      if (statusParam === "Today's Dispatch") {
+        const todayStart = new Date();
+        todayStart.setHours(0, 0, 0, 0);
+        const todayEnd = new Date();
+        todayEnd.setHours(23, 59, 59, 999);
+        assigned.updatedAt = { $gte: todayStart, $lte: todayEnd };
+      }
     }
 
     const orConds: any[] = [assigned];
@@ -294,7 +317,13 @@ export const updateOrderStatus = async (
   try {
     const vendorId = req.vendor!.id;
     const raw = String(req.params.id || "").trim();
-    const { action, reason } = req.body as { action?: string; reason?: string };
+    const { action, reason, reasonCategory } = req.body as {
+      action?: string;
+      reason?: string;
+      // e.g. "damaged_goods" — a lightweight categorization tag, stored
+      // alongside the free-text reason rather than as its own schema field.
+      reasonCategory?: string;
+    };
 
     const allowed = ["accept", "reject"];
     if (!action || !allowed.includes(action)) {
@@ -374,14 +403,28 @@ export const updateOrderStatus = async (
       if (!isAssignedToMe) {
         throw new AppError("This order is not assigned to you.", 403);
       }
-      if (!["pending", "accepted", "confirmed"].includes(booking.status)) {
+      // Rejection is allowed through QC/packing too (e.g. damaged goods
+      // discovered during QC) — only once it's actually left the vendor
+      // (dispatched/in_transit/delivered) is it too late to reject.
+      if (
+        ![
+          "pending",
+          "accepted",
+          "confirmed",
+          "qc_pending",
+          "qc_approved",
+          "packed",
+        ].includes(booking.status)
+      ) {
         throw new AppError("This order can no longer be rejected.", 400);
       }
 
       if (!Array.isArray(booking.rejectedByVendors)) booking.rejectedByVendors = [];
       booking.rejectedByVendors.push(vendorObjId);
-      if (reason) {
-        booking.notes = `${booking.notes ? booking.notes + "\n" : ""}Rejected: ${reason}`;
+      const reasonLabel = reasonCategory === "damaged_goods" ? "Damaged Goods" : null;
+      if (reason || reasonLabel) {
+        const tag = reasonLabel ? `[${reasonLabel}] ` : "";
+        booking.notes = `${booking.notes ? booking.notes + "\n" : ""}Rejected: ${tag}${reason || ""}`.trim();
       }
 
       // Try to reopen the order for other eligible (matching pincode,
@@ -617,9 +660,9 @@ export const getOrderInvoice = async (
           pincode: vendorDoc.business?.pincode || null,
         },
         customer: {
-          name: booking.user?.name || "Customer",
-          mobile: booking.user?.mobile || null,
-          site: booking.site || null,
+          name: booking.buyerDetails?.name || booking.user?.name || "Customer",
+          mobile: booking.buyerDetails?.mobile || booking.user?.mobile || null,
+          site: booking.buyerDetails?.deliveryAddress || booking.site || null,
         },
         item: {
           materialName: material?.name || "",
@@ -797,9 +840,31 @@ export const dispatchOrder = async (
       );
     }
 
+    // Never trust client-only date validation (same rationale throughout —
+    // e.g. validateBuyerDetails in mobileOrders.controller.ts).
+    if (dispatchDate) {
+      const parsedDate = new Date(dispatchDate);
+      const startOfToday = new Date();
+      startOfToday.setHours(0, 0, 0, 0);
+      if (!Number.isNaN(parsedDate.getTime()) && parsedDate.getTime() < startOfToday.getTime()) {
+        throw new AppError("Dispatch date cannot be in the past.", 400);
+      }
+    }
+
+    // Vehicle-capacity matching: the weight this delivery needs, used to
+    // exclude under-capacity drivers from explicit-pick validation and the
+    // auto-assign fallback below (see Driver.model.ts's liftingCapacityKg).
+    const material = await Material.findById(booking.material)
+      .select("weightPerUnit")
+      .lean();
+    const requiredWeightKg = material?.weightPerUnit
+      ? material.weightPerUnit * booking.quantity
+      : undefined;
+
     // Resolve the driver: explicit pick, else auto-assign first eligible.
     let driverName: string | undefined;
     let assignedVehicle: string | undefined;
+    let assignedFcmToken: string | undefined;
     if (driverId) {
       if (!/^[a-fA-F0-9]{24}$/.test(driverId)) {
         throw new AppError("Invalid driverId.", 400);
@@ -810,31 +875,46 @@ export const dispatchOrder = async (
         approvalStatus: "approved",
         isDeleted: false,
       })
-        .select("name vehicles.registrationNo")
+        .select("name vehicles.registrationNo vehicles.liftingCapacityKg deviceInfo.fcmToken")
         .lean();
       if (!driver) {
         throw new AppError("Selected driver is not assignable.", 400);
       }
+      if (requiredWeightKg) {
+        const capacities = (driver.vehicles || [])
+          .map((v: any) => Number(v.liftingCapacityKg) || 0)
+          .filter((n: number) => n > 0);
+        const maxCapacity = capacities.length ? Math.max(...capacities) : 0;
+        if (maxCapacity > 0 && maxCapacity < requiredWeightKg) {
+          throw new AppError(
+            `Selected driver's vehicle capacity is too low for this delivery (needs at least ${requiredWeightKg}kg).`,
+            400,
+          );
+        }
+      }
       booking.driver = driver._id as mongoose.Types.ObjectId;
       driverName = driver.name;
       assignedVehicle = driver.vehicles?.[0]?.registrationNo;
+      assignedFcmToken = (driver as any).deviceInfo?.fcmToken;
     } else if (booking.driver) {
       // A driver already early-claimed this order (right after the vendor
       // accepted it, matched by pincode) — keep them rather than picking a
       // different one.
       const existing = await Driver.findById(booking.driver)
-        .select("name vehicles.registrationNo")
+        .select("name vehicles.registrationNo deviceInfo.fcmToken")
         .lean();
       if (existing) {
         driverName = existing.name;
         assignedVehicle = existing.vehicles?.[0]?.registrationNo;
+        assignedFcmToken = (existing as any).deviceInfo?.fcmToken;
       }
     } else {
-      const driver = await findFirstAvailableDriver();
+      const driver = await findFirstAvailableDriver(requiredWeightKg);
       if (driver) {
         booking.driver = driver._id;
         driverName = driver.name;
         assignedVehicle = driver.vehicles?.[0]?.registrationNo;
+        assignedFcmToken = driver.deviceInfo?.fcmToken;
       }
     }
 
@@ -850,6 +930,24 @@ export const dispatchOrder = async (
     pushStatus(booking, "dispatched");
 
     await booking.save();
+
+    // New delivery request → push to the assigned driver (fixes the driver
+    // app relying purely on 20s polling to learn about a dispatched order).
+    if (assignedFcmToken) {
+      sendPush(
+        [assignedFcmToken],
+        "New delivery assigned",
+        `Order ${booking.bookingId} has been dispatched to you. Tap to view.`,
+        { bookingId: String(booking._id) },
+      ).catch(() => {});
+    }
+    notifyAdmin({
+      title: "Order dispatched",
+      message: `Order ${booking.bookingId} was dispatched${driverName ? ` to driver ${driverName}` : ""}.`,
+      booking: booking._id,
+      createdBy: vendorId,
+    }).catch(() => {});
+
     const populated = await populateBooking(Booking.findById(booking._id));
     res.json({ success: true, data: formatBooking(populated) });
   } catch (error) {
@@ -872,7 +970,27 @@ export const getAssignableDrivers = async (
     const vendorDoc = await Vendor.findById(req.vendor!.id)
       .select("business.pincode")
       .lean();
-    const drivers = await findAssignableDrivers(vendorDoc?.business?.pincode);
+
+    // Optional ?bookingId — when given, excludes drivers whose vehicle can't
+    // carry that booking's required weight (vehicle-capacity matching).
+    let requiredWeightKg: number | undefined;
+    const bookingId = req.query.bookingId as string | undefined;
+    if (bookingId) {
+      const booking = await findVendorBooking(req.vendor!.id, bookingId);
+      if (booking) {
+        const material = await Material.findById(booking.material)
+          .select("weightPerUnit")
+          .lean();
+        requiredWeightKg = material?.weightPerUnit
+          ? material.weightPerUnit * booking.quantity
+          : undefined;
+      }
+    }
+
+    const drivers = await findAssignableDrivers(
+      vendorDoc?.business?.pincode,
+      requiredWeightKg,
+    );
     res.json({
       success: true,
       data: drivers.map(d => ({
@@ -976,9 +1094,12 @@ export const getVendorInvoiceHtml = async (
       orderNo: booking.bookingId,
       issuedDate: issued,
       paymentMethod: booking.paymentMethod,
-      consigneeName: cust.name || "Customer",
-      consigneeAddress: booking.site || cust.address?.full,
-      consigneeMobile: cust.mobile,
+      // Frozen per-order snapshot, not a live User read (see
+      // mobileOrders.controller.ts's getOrderInvoiceHtml for the rationale).
+      consigneeName: booking.buyerDetails?.name || cust.name || "Customer",
+      consigneeAddress:
+        booking.buyerDetails?.deliveryAddress || booking.site || cust.address?.full,
+      consigneeMobile: booking.buyerDetails?.mobile || cust.mobile,
       dispatchThrough: booking.dispatch?.driverName,
       vehicleNumber: booking.dispatch?.vehicleNumber,
       materialName: material.name || "",

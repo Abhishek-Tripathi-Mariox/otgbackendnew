@@ -77,6 +77,44 @@ export const createOrder = async (
   }
 };
 
+export interface RazorpayRefundResult {
+  id: string;
+  status: string;
+  amount: number;
+}
+
+/**
+ * Issues a (possibly partial) refund for a captured payment. Returns null if
+ * Razorpay isn't configured or the API call fails — the caller must never
+ * block a cancellation on refund success; a failed refund becomes a
+ * visible manual-follow-up flag instead (see mobileOrders.controller.ts
+ * cancelOrder).
+ */
+export const refund = async (
+  paymentId: string,
+  amountInRupees: number,
+  notes?: Record<string, string>,
+): Promise<RazorpayRefundResult | null> => {
+  const creds = await getRazorpayCreds();
+  if (!creds) return null;
+
+  try {
+    const client = getClient(creds);
+    const result = await client.payments.refund(paymentId, {
+      amount: Math.round(amountInRupees * 100),
+      notes,
+    });
+    return {
+      id: result.id,
+      status: result.status,
+      amount: Number(result.amount),
+    };
+  } catch (error) {
+    console.error("[razorpayService] refund failed:", error);
+    return null;
+  }
+};
+
 // Constant-time comparison — a plain `===` on hex digests leaks timing
 // information proportional to how many leading characters match, which is a
 // standard side-channel weakness for HMAC/signature verification. Length is

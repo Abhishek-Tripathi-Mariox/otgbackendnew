@@ -59,6 +59,96 @@ export interface IBookingStatusHistory {
   note?: string;
 }
 
+// Buyer/site details captured at checkout — required for both an individual
+// buyer and one ordering on behalf of a company (GSTIN/PAN/company-type etc).
+// Frozen on the Booking at creation time (NOT live-read from User later) so
+// a subsequent profile edit never silently rewrites a past order's invoice.
+export type CompanyType =
+  | "Contractor"
+  | "Builder"
+  | "Developer"
+  | "Consultant"
+  | "Government"
+  | "Individual";
+
+export interface IBuyerDetails {
+  accountType: "individual" | "company";
+  name: string;
+  mobile: string;
+  email?: string;
+  deliveryAddress: string;
+  landmark?: string;
+  city: string;
+  pincode: string;
+  siteContactNumber?: string;
+  // Company-only
+  designation?: string;
+  employeeId?: string;
+  companyName?: string;
+  gstin?: string;
+  pan?: string;
+  billingAddress?: string;
+  registeredOfficeAddress?: string;
+  companyType?: CompanyType;
+  projectName?: string;
+  siteAddress?: string;
+  siteContactPerson?: string;
+}
+
+const GSTIN_REGEX = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
+const MOBILE_REGEX = /^[6-9]\d{9}$/;
+
+// Deliberately no `required: true` on any of these nested-path fields — this
+// same field-map is reused for BOTH `Booking.buyerDetails` (must be fully
+// filled by the time a customer checks out) AND `User.checkoutProfile` (a
+// pre-fill convenience that legitimately doesn't exist for e.g. a
+// brand-new/never-checked-out User doc). Mongoose enforces `required` on
+// nested-path leaves independently of whether the parent object was ever
+// set, which would break plain user signup if turned on here — so the
+// "mandatory before payment" rule is enforced at the application layer
+// instead (see validateBuyerDetails in mobileOrders.controller.ts), not the
+// schema layer.
+export const buyerDetailsSchemaFields = {
+  accountType: { type: String, enum: ["individual", "company"] },
+  name: { type: String, trim: true },
+  mobile: {
+    type: String,
+    trim: true,
+    validate: {
+      validator: (v: string) => !v || MOBILE_REGEX.test(v),
+      message: "Mobile number must be a valid 10-digit Indian number",
+    },
+  },
+  email: { type: String, trim: true, lowercase: true },
+  deliveryAddress: { type: String, trim: true },
+  landmark: { type: String, trim: true },
+  city: { type: String, trim: true },
+  pincode: { type: String, trim: true },
+  siteContactNumber: { type: String, trim: true },
+  designation: { type: String, trim: true },
+  employeeId: { type: String, trim: true },
+  companyName: { type: String, trim: true },
+  gstin: {
+    type: String,
+    trim: true,
+    uppercase: true,
+    validate: {
+      validator: (v: string) => !v || GSTIN_REGEX.test(v),
+      message: "GST number must be a valid 15-character GSTIN",
+    },
+  },
+  pan: { type: String, trim: true, uppercase: true },
+  billingAddress: { type: String, trim: true },
+  registeredOfficeAddress: { type: String, trim: true },
+  companyType: {
+    type: String,
+    enum: ["Contractor", "Builder", "Developer", "Consultant", "Government", "Individual"],
+  },
+  projectName: { type: String, trim: true },
+  siteAddress: { type: String, trim: true },
+  siteContactPerson: { type: String, trim: true },
+};
+
 export interface IBookingDocument extends Document {
   bookingId: string;
   user: mongoose.Types.ObjectId;
@@ -73,6 +163,10 @@ export interface IBookingDocument extends Document {
   totalAmount: number;
   site?: string;
   pincode?: string;
+  buyerDetails?: IBuyerDetails;
+  // Set when this booking was auto-generated from an accepted bulk Quotation
+  // (one Booking per quotation line item) — links back for traceability.
+  quotationRef?: mongoose.Types.ObjectId;
   status: BookingStatus;
   paymentStatus: "pending" | "partial" | "completed";
   paymentMethod?: string;
@@ -82,6 +176,14 @@ export interface IBookingDocument extends Document {
   // reopened/re-notified to remaining vendors so it isn't re-offered to
   // someone who already turned it down.
   rejectedByVendors?: mongoose.Types.ObjectId[];
+  // Same idea for drivers: a driver who rejects a dispatched/early-offer
+  // booking is excluded when it's reopened/re-notified to remaining
+  // pincode-matched drivers, so it isn't re-offered to someone who already
+  // turned it down.
+  rejectedByDrivers?: mongoose.Types.ObjectId[];
+  // Proof-of-delivery photo captured by the driver, required before an order
+  // can be marked "delivered".
+  podPhotoUrl?: string;
   notes?: string;
   deliveryDate?: Date;
   qc?: IBookingQC;
@@ -172,6 +274,16 @@ const BookingSchema: Schema = new Schema(
       trim: true,
       index: true,
     },
+    // Not required at the schema level (the separate admin manual-create-
+    // booking flow doesn't collect it) — the CUSTOMER checkout flow enforces
+    // it via application-level validation (see validateBuyerDetails in
+    // mobileOrders.controller.ts) before a Booking is ever created that way.
+    buyerDetails: buyerDetailsSchemaFields,
+    quotationRef: {
+      type: Schema.Types.ObjectId,
+      ref: "Quotation",
+      default: null,
+    },
     status: {
       type: String,
       enum: BOOKING_STATUSES,
@@ -201,6 +313,16 @@ const BookingSchema: Schema = new Schema(
         ref: "Vendor",
       },
     ],
+    rejectedByDrivers: [
+      {
+        type: Schema.Types.ObjectId,
+        ref: "Driver",
+      },
+    ],
+    podPhotoUrl: {
+      type: String,
+      trim: true,
+    },
     notes: {
       type: String,
       trim: true,

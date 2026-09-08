@@ -8,6 +8,7 @@ export interface IAdmin {
   role: "super-admin" | "sub-admin";
   permissions: string[];
   isActive: boolean;
+  currentSessionId?: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -62,6 +63,10 @@ export interface JwtPayload {
   email: string;
   role: string;
   userType?: "admin" | "staff";
+  // Compared against Admin/Staff.currentSessionId on every authenticated
+  // request — a newer login on another device overwrites the stored value,
+  // invalidating this token (see auth.controller.ts login, auth.middleware.ts).
+  sessionId?: string;
 }
 
 export type Permission =

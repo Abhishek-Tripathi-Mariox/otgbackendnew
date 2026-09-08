@@ -14,6 +14,7 @@ import {
   saveOwner,
   savePersonal,
   saveDrivingLicense,
+  saveSecurityPhoto,
   saveBank,
   reuploadDrivingLicense,
   reuploadVehicleDocument,
@@ -91,6 +92,13 @@ router.post(
   "/documents/driving-license/reupload",
   authenticateDriver,
   reuploadDrivingLicense,
+);
+
+// Security selfie (driver-owned doc, captured during the personal step)
+router.post(
+  "/documents/security-photo",
+  authenticateDriver,
+  saveSecurityPhoto,
 );
 
 // Notifications

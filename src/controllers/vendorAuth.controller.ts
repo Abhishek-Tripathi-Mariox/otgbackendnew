@@ -547,7 +547,7 @@ export const updateMe = async (
       throw new AppError("Vendor not found", 404);
     }
 
-    const { name, email, business, bankDetails } = req.body || {};
+    const { name, email, business, bankDetails, location } = req.body || {};
 
     if (typeof name === "string" && name.trim()) {
       vendor.name = name.trim();
@@ -573,6 +573,27 @@ export const updateMe = async (
           (vendor.business as any)[key] = incoming.trim();
         }
       }
+    }
+
+    // Admin's Vendors table reads `vendor.location.address` (see
+    // Vendors.jsx) — previously only ever set at signup (saveBusinessStep),
+    // so a later Profile address edit never reached it. Update it here too
+    // whenever the client sends fresh geocoded coordinates alongside the
+    // address change.
+    if (
+      location &&
+      typeof location === "object" &&
+      Array.isArray(location.coordinates) &&
+      location.coordinates.length === 2
+    ) {
+      vendor.set("location", {
+        type: "Point",
+        coordinates: location.coordinates,
+        address:
+          typeof location.address === "string"
+            ? location.address
+            : vendor.location?.address,
+      });
     }
 
     if (bankDetails && typeof bankDetails === "object") {
@@ -910,6 +931,19 @@ export const getVendorDashboard = async (
 
     const baseMatch = { vendor: vendorObjId, isDeleted: false };
 
+    // Real lifecycle statuses (Booking.model.ts) — `confirmed` is a legacy
+    // alias of `accepted`, kept here for older bookings. "In Progress" is the
+    // vendor's own active work: accepted through packed, i.e. everything
+    // between "just placed" (pending) and "handed off for delivery"
+    // (dispatched/in_transit/delivered).
+    const IN_PROGRESS_STATUSES = [
+      "accepted",
+      "confirmed",
+      "qc_pending",
+      "qc_approved",
+      "packed",
+    ];
+
     const [statusCounts] = await Booking.aggregate([
       { $match: baseMatch },
       {
@@ -919,7 +953,21 @@ export const getVendorDashboard = async (
             $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] },
           },
           inProgress: {
-            $sum: { $cond: [{ $eq: ["$status", "confirmed"] }, 1, 0] },
+            $sum: {
+              $cond: [{ $in: ["$status", IN_PROGRESS_STATUSES] }, 1, 0],
+            },
+          },
+          qcPending: {
+            $sum: { $cond: [{ $eq: ["$status", "qc_pending"] }, 1, 0] },
+          },
+          readyForDispatch: {
+            $sum: {
+              $cond: [
+                { $in: ["$status", ["qc_approved", "packed"]] },
+                1,
+                0,
+              ],
+            },
           },
           inTransit: {
             $sum: { $cond: [{ $eq: ["$status", "in_transit"] }, 1, 0] },
@@ -945,9 +993,13 @@ export const getVendorDashboard = async (
       },
     ]);
 
+    // Dispatch actually sets status "dispatched" (vendorOrders.controller.ts
+    // dispatchOrder), not "in_transit" (that's the driver's later pickup) —
+    // this previously undercounted every dispatched-but-not-yet-picked-up
+    // order.
     const todayDispatchCount = await Booking.countDocuments({
       ...baseMatch,
-      status: "in_transit",
+      status: "dispatched",
       updatedAt: { $gte: todayStart, $lte: todayEnd },
     });
 
@@ -993,6 +1045,8 @@ export const getVendorDashboard = async (
     const counts = statusCounts || {
       newOrders: 0,
       inProgress: 0,
+      qcPending: 0,
+      readyForDispatch: 0,
       inTransit: 0,
       delivered: 0,
       pendingPayment: 0,
@@ -1008,8 +1062,8 @@ export const getVendorDashboard = async (
           pendingPayment: counts.pendingPayment || 0,
         },
         operations: {
-          qcPending: counts.newOrders || 0,
-          readyForDispatch: counts.inProgress || 0,
+          qcPending: counts.qcPending || 0,
+          readyForDispatch: counts.readyForDispatch || 0,
           inTransit: counts.inTransit || 0,
           delayed: 0,
         },

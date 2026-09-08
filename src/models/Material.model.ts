@@ -9,6 +9,11 @@ export interface IMaterial extends Document {
   category: mongoose.Types.ObjectId;
   subCategory?: mongoose.Types.ObjectId | null;
   unit: string;
+  // Weight of a single unit in kg — used to compute a booking's required
+  // delivery weight (quantity * weightPerUnit) for automatic driver vehicle-
+  // capacity matching. Optional: a material without it simply never blocks
+  // any driver during matching (treated as "no weight requirement").
+  weightPerUnit?: number;
   minOrderQty: number;
   diameter?: string;
   basicPrice: number;
@@ -78,6 +83,11 @@ const materialSchema = new Schema<IMaterial>(
       required: [true, "Unit is required"],
       trim: true,
       maxlength: [50, "Unit cannot exceed 50 characters"],
+    },
+    weightPerUnit: {
+      type: Number,
+      min: [0, "Weight per unit cannot be negative"],
+      default: null,
     },
     minOrderQty: {
       type: Number,
