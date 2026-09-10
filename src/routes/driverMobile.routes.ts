@@ -6,6 +6,7 @@ import {
   getMe,
   logout,
   updateProfileImage,
+  updateFCMToken,
 } from "../controllers/driverAuth.controller";
 import {
   addVehicle,
@@ -55,6 +56,7 @@ router.post("/auth/resend-otp", resendOTP);
 // Authed
 router.get("/auth/me", authenticateDriver, getMe);
 router.post("/auth/logout", authenticateDriver, logout);
+router.put("/fcm-token", authenticateDriver, updateFCMToken);
 router.put(
   "/profile-image",
   authenticateDriver,

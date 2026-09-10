@@ -295,3 +295,30 @@ export const logout = async (
     next(error);
   }
 };
+
+// PUT /api/mobile/driver/fcm-token — called after login whenever the app's
+// FCM token is first obtained or later rotates (messaging().onTokenRefresh),
+// since verify-otp only captures it once at sign-in time.
+export const updateFCMToken = async (
+  req: DriverRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const driverId = req.driver?.id;
+    const { fcmToken } = req.body;
+
+    if (!driverId) throw new AppError("Unauthorized", 401);
+    if (!fcmToken) throw new AppError("FCM token is required", 400);
+
+    const driver = await Driver.findById(driverId);
+    if (!driver || driver.isDeleted) throw new AppError("Driver not found", 404);
+
+    driver.deviceInfo = { ...driver.deviceInfo, fcmToken };
+    await driver.save();
+
+    res.json({ success: true, message: "FCM token updated" });
+  } catch (error) {
+    next(error);
+  }
+};

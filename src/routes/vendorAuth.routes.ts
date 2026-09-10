@@ -6,6 +6,7 @@ import {
   getMe,
   updateMe,
   logout,
+  updateFCMToken,
   listVendorNotifications,
   getVendorUnreadCount,
   markAllVendorNotificationsRead,
@@ -33,6 +34,7 @@ router.post("/resend-otp", resendOTP);
 router.get("/me", authenticateVendor, getMe);
 router.put("/me", authenticateVendor, updateMe);
 router.post("/logout", authenticateVendor, logout);
+router.put("/fcm-token", authenticateVendor, updateFCMToken);
 
 // Protected — registration/onboarding steps (each advances onboardingStep)
 router.post("/onboarding/business", authenticateVendor, saveBusinessStep);

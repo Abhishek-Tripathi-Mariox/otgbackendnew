@@ -521,6 +521,33 @@ export const logout = async (
   }
 };
 
+// PUT /api/vendor/auth/fcm-token — called after login whenever the app's FCM
+// token is first obtained or later rotates (messaging().onTokenRefresh),
+// since verify-otp only captures it once at sign-in time.
+export const updateFCMToken = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const vendorId = (req as any).vendor?.id;
+    const { fcmToken } = req.body;
+
+    if (!vendorId) throw new AppError("Unauthorized", 401);
+    if (!fcmToken) throw new AppError("FCM token is required", 400);
+
+    const vendor = await Vendor.findById(vendorId);
+    if (!vendor || vendor.isDeleted) throw new AppError("Vendor not found", 404);
+
+    vendor.deviceInfo = { ...vendor.deviceInfo, fcmToken };
+    await vendor.save();
+
+    res.json({ success: true, message: "FCM token updated" });
+  } catch (error) {
+    next(error);
+  }
+};
+
 /**
  * Update authenticated vendor profile (self-service)
  * PUT /api/vendor/auth/me
