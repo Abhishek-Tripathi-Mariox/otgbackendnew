@@ -841,6 +841,94 @@ export const updateVendorMaterial = async (
   }
 };
 
+// POST /api/vendors/:vendorId/materials/:materialId/rate-change/approve
+// Approves a vendor-submitted rate change (E24-26): applies pendingPrice to
+// price and records the decision in rateHistory. No-op error if there's
+// nothing pending (avoids double-approving a stale button click).
+export const approveVendorRateChange = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { vendorId, materialId } = req.params;
+    const vm = await VendorMaterial.findOne({ vendor: vendorId, material: materialId });
+    if (!vm) throw new AppError("Vendor material not found", 404);
+    if (vm.pendingPrice == null) {
+      throw new AppError("This material has no pending rate change", 400);
+    }
+
+    if (!Array.isArray(vm.rateHistory)) vm.rateHistory = [];
+    vm.rateHistory.push({
+      price: vm.pendingPrice,
+      requestedAt: vm.pendingPriceRequestedAt || new Date(),
+      status: "approved",
+      reviewedBy: new mongoose.Types.ObjectId(req.admin!._id),
+      reviewedAt: new Date(),
+    });
+    vm.price = vm.pendingPrice;
+    vm.pendingPrice = undefined;
+    vm.pendingPriceRequestedAt = undefined;
+    vm.updatedBy = new mongoose.Types.ObjectId(req.admin!._id);
+    await vm.save({ validateModifiedOnly: true });
+
+    const populated = await VendorMaterial.findById(vm._id).populate({
+      path: "material",
+      populate: [
+        { path: "category", select: "name" },
+        { path: "subCategory", select: "name" },
+      ],
+    });
+
+    res.json({ success: true, message: "Rate change approved", data: populated });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// POST /api/vendors/:vendorId/materials/:materialId/rate-change/reject
+// Rejects a vendor-submitted rate change: price stays at its prior value,
+// the attempt is recorded in rateHistory for the negotiation trail.
+export const rejectVendorRateChange = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { vendorId, materialId } = req.params;
+    const vm = await VendorMaterial.findOne({ vendor: vendorId, material: materialId });
+    if (!vm) throw new AppError("Vendor material not found", 404);
+    if (vm.pendingPrice == null) {
+      throw new AppError("This material has no pending rate change", 400);
+    }
+
+    if (!Array.isArray(vm.rateHistory)) vm.rateHistory = [];
+    vm.rateHistory.push({
+      price: vm.pendingPrice,
+      requestedAt: vm.pendingPriceRequestedAt || new Date(),
+      status: "rejected",
+      reviewedBy: new mongoose.Types.ObjectId(req.admin!._id),
+      reviewedAt: new Date(),
+    });
+    vm.pendingPrice = undefined;
+    vm.pendingPriceRequestedAt = undefined;
+    vm.updatedBy = new mongoose.Types.ObjectId(req.admin!._id);
+    await vm.save({ validateModifiedOnly: true });
+
+    const populated = await VendorMaterial.findById(vm._id).populate({
+      path: "material",
+      populate: [
+        { path: "category", select: "name" },
+        { path: "subCategory", select: "name" },
+      ],
+    });
+
+    res.json({ success: true, message: "Rate change rejected", data: populated });
+  } catch (error) {
+    next(error);
+  }
+};
+
 // Remove material from vendor
 export const removeVendorMaterial = async (
   req: AuthRequest,

@@ -12,6 +12,12 @@ export interface IInvoiceDocument extends Document {
   sellerSnapshot: Record<string, unknown>;
   buyerSnapshot: Record<string, unknown>;
   amount: number;
+  // GST portion of `amount` — stored explicitly (rather than re-derived at
+  // render time from Booking.gstAmount) because vendor_to_otg's amount is
+  // computed from the vendor's own VendorMaterial rate, not the customer's
+  // booking total, so its GST is a different figure than vendor_to_customer's.
+  // Optional/undefined on invoices generated before this field existed.
+  gstAmount?: number;
   generatedAt: Date;
   generatedBy: "auto" | mongoose.Types.ObjectId;
   createdAt: Date;
@@ -47,6 +53,10 @@ const InvoiceSchema: Schema = new Schema(
       type: Number,
       required: [true, "Amount is required"],
       min: [0, "Amount cannot be negative"],
+    },
+    gstAmount: {
+      type: Number,
+      min: [0, "GST amount cannot be negative"],
     },
     generatedAt: {
       type: Date,

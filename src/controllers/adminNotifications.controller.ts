@@ -30,6 +30,8 @@ export const listAdminNotifications = async (
       message: n.message,
       createdAt: n.createdAt,
       booking: n.booking || null,
+      quotation: n.quotation || null,
+      vendor: n.vendor || null,
       image: n.image || null,
       unread: !n.readByAdmin,
     }));

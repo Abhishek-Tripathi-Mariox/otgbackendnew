@@ -15,6 +15,8 @@ import {
   getVendorMaterials,
   addVendorMaterial,
   updateVendorMaterial,
+  approveVendorRateChange,
+  rejectVendorRateChange,
   removeVendorMaterial,
   toggleVendorMaterialAvailability,
   getStates,
@@ -73,6 +75,16 @@ router.post("/:vendorId/materials", addVendorMaterial);
 
 // Update vendor material
 router.put("/:vendorId/materials/:materialId", updateVendorMaterial);
+
+// Approve / reject a vendor-submitted rate change (E24-26)
+router.post(
+  "/:vendorId/materials/:materialId/rate-change/approve",
+  approveVendorRateChange,
+);
+router.post(
+  "/:vendorId/materials/:materialId/rate-change/reject",
+  rejectVendorRateChange,
+);
 
 // Remove material from vendor
 router.delete("/:vendorId/materials/:materialId", removeVendorMaterial);

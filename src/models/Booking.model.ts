@@ -14,6 +14,11 @@ export type BookingStatus =
   | "in_transit"
   | "delivered"
   | "cancelled"
+  // The customer's selected vendor rejected this order (Section I / Phase
+  // 7) — NOT auto-reassigned or auto-cancelled per the client's explicit
+  // requirement; needs admin manual resolution (reassign via the existing
+  // admin vendor picker, or cancel with refund).
+  | "vendor_rejected"
   | "confirmed"; // legacy alias of "accepted"
 
 // `paymentMethod` is a free-text label chosen in the customer app (e.g. "Cash
@@ -35,6 +40,7 @@ export const BOOKING_STATUSES: BookingStatus[] = [
   "in_transit",
   "delivered",
   "cancelled",
+  "vendor_rejected",
   "confirmed",
 ];
 
@@ -182,8 +188,10 @@ export interface IBookingDocument extends Document {
   // turned it down.
   rejectedByDrivers?: mongoose.Types.ObjectId[];
   // Proof-of-delivery photo captured by the driver, required before an order
-  // can be marked "delivered".
+  // can be marked "delivered". Who captured it is `driver` (already on this
+  // document) — no separate field needed.
   podPhotoUrl?: string;
+  podCapturedAt?: Date;
   notes?: string;
   deliveryDate?: Date;
   qc?: IBookingQC;
@@ -322,6 +330,9 @@ const BookingSchema: Schema = new Schema(
     podPhotoUrl: {
       type: String,
       trim: true,
+    },
+    podCapturedAt: {
+      type: Date,
     },
     notes: {
       type: String,

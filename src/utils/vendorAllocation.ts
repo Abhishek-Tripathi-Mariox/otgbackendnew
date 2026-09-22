@@ -26,10 +26,14 @@ export async function findNearestVendorForMaterial(
     return null;
   }
 
-  // Vendors that actually stock this material and have it available
+  // Vendors that actually stock this material and have it available — only
+  // an admin-approved VendorMaterial entry counts. A vendor's still-pending
+  // (or rejected) listing must never get that vendor auto-allocated to a
+  // real order.
   const stocking = await VendorMaterial.find({
     material: materialId,
     isAvailable: true,
+    verificationStatus: "approved",
   })
     .select("vendor")
     .lean();

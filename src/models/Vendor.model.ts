@@ -98,6 +98,8 @@ const VendorSchema: Schema = new Schema(
     vendorCode: {
       type: String,
       trim: true,
+      unique: true,
+      sparse: true,
     },
     name: {
       type: String,

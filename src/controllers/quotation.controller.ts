@@ -155,6 +155,7 @@ export const createQuotation = async (
     notifyAdmin({
       title: "New bulk quotation request",
       message: `${quotation.name} (${quotation.mobile}) submitted a new quotation request — ${quotation.quotationCode}.`,
+      quotation: quotation._id,
       createdBy: quotation.user || undefined,
     }).catch(() => {});
 
@@ -319,11 +320,20 @@ export const setMyQuotationStatus = async (
       );
     }
 
-    quotation.status = status;
+    // A customer acceptance moves the request into backend/procurement
+    // handling — distinct from the generic "accepted" status admin can also
+    // set manually (updateQuotationStatus). "rejected" is unchanged.
+    quotation.status = status === "accepted" ? "procurement" : "rejected";
     await quotation.save();
 
     if (status === "accepted") {
       await generateBookingsFromQuotation(quotation);
+      notifyAdmin({
+        title: "Quotation accepted by customer",
+        message: `${quotation.name} accepted quotation ${quotation.quotationCode} — it has moved to procurement.`,
+        quotation: quotation._id,
+        createdBy: quotation.user || undefined,
+      }).catch(() => {});
     }
 
     res.json({
@@ -427,6 +437,22 @@ export const respondToQuotation = async (
     const quotation = await Quotation.findById(id);
     if (!quotation) throw new AppError("Quotation not found", 404);
 
+    // A response to an already-quoted request is a revision, not a first
+    // send — the buyer-facing push wording differs accordingly, and the
+    // PRIOR quote must be preserved (not silently overwritten) below.
+    const isRevision = quotation.status === "quoted";
+
+    if (isRevision) {
+      if (!Array.isArray(quotation.quoteHistory)) quotation.quoteHistory = [];
+      quotation.quoteHistory.push({
+        quotedPrice: quotation.quotedPrice ?? null,
+        quotedValidTill: quotation.quotedValidTill ?? null,
+        adminNotes: quotation.adminNotes,
+        respondedBy: quotation.respondedBy ?? null,
+        respondedAt: quotation.respondedAt ?? null,
+      });
+    }
+
     if (quotedPrice !== undefined && quotedPrice !== null && quotedPrice !== "") {
       const num = Number(quotedPrice);
       if (!Number.isFinite(num) || num < 0) {
@@ -436,9 +462,6 @@ export const respondToQuotation = async (
     }
     if (quotedValidTill) quotation.quotedValidTill = new Date(quotedValidTill);
     if (adminNotes !== undefined) quotation.adminNotes = adminNotes;
-    // A response to an already-quoted request is a revision, not a first
-    // send — the buyer-facing push wording differs accordingly.
-    const isRevision = quotation.status === "quoted";
     quotation.status = "quoted";
     quotation.respondedBy = new mongoose.Types.ObjectId(req.admin!._id);
     quotation.respondedAt = new Date();
@@ -492,12 +515,16 @@ export const uploadQuotationPdf = async (
     const quotation = await Quotation.findById(id);
     if (!quotation) throw new AppError("Quotation not found", 404);
 
-    // Remove the previously uploaded PDF (if any) to avoid orphaned files.
-    if (quotation.quotationPdf?.url) {
-      await deleteFromS3(quotation.quotationPdf.url);
+    // This is admin's FORMAL quotation back to the customer — a separate
+    // slot from `quotationPdf` (the customer's own RFQ upload from
+    // createQuotation). Only remove a previously-uploaded OTG quotation
+    // (i.e. a re-upload replacing admin's own prior document), never the
+    // customer's file.
+    if (quotation.otgQuotationPdf?.url) {
+      await deleteFromS3(quotation.otgQuotationPdf.url);
     }
 
-    quotation.quotationPdf = {
+    quotation.otgQuotationPdf = {
       url: file.location,
       name: file.originalname,
       uploadedAt: new Date(),
@@ -523,7 +550,14 @@ export const updateQuotationStatus = async (
     const { id } = req.params;
     const { status } = req.body;
 
-    const allowed = ["new", "quoted", "accepted", "rejected", "expired"];
+    const allowed = [
+      "new",
+      "quoted",
+      "accepted",
+      "procurement",
+      "rejected",
+      "expired",
+    ];
     if (!allowed.includes(status)) {
       throw new AppError("Invalid status", 400);
     }
@@ -538,7 +572,7 @@ export const updateQuotationStatus = async (
     }
     await quotation.save();
 
-    if (status === "accepted") {
+    if (status === "accepted" || status === "procurement") {
       await generateBookingsFromQuotation(quotation);
     }
 
@@ -654,6 +688,18 @@ export const assignVendorToQuotation = async (
 // ===================== VENDOR =====================
 
 // Vendor lists quotations assigned to them
+// Fields a vendor must NEVER see: the customer's negotiated/quoted price
+// (top-level and per-item), quote validity/currency, admin's internal
+// notes, and OTG's formal quotation document to the customer (all of these
+// either directly contain, or are strong proxies for, the customer-facing
+// price/margin — see the access-control requirement in the "vendor must
+// never see OTG's quotation/price to customer" spec). Applied via `.select()`
+// (a real MongoDB-level exclusion, not a post-hoc field-delete) to every
+// vendor-facing quotation read so the confidential data never reaches the
+// wire, not just the UI.
+const VENDOR_QUOTATION_EXCLUDE =
+  "-quotedPrice -items.quotedPrice -quotedCurrency -quotedValidTill -adminNotes -otgQuotationPdf -quoteHistory";
+
 export const listVendorQuotations = async (
   req: VendorRequest,
   res: Response,
@@ -668,6 +714,7 @@ export const listVendorQuotations = async (
     if (status && status !== "all") query.status = status;
 
     const quotations = await Quotation.find(query)
+      .select(VENDOR_QUOTATION_EXCLUDE)
       .populate("user", "name mobile email")
       .sort({ assignedAt: -1, createdAt: -1 })
       .limit(200);
@@ -692,7 +739,9 @@ export const getVendorQuotation = async (
     const quotation = await Quotation.findOne({
       _id: id,
       assignedVendor: vendorId,
-    }).populate("user", "name mobile email");
+    })
+      .select(VENDOR_QUOTATION_EXCLUDE)
+      .populate("user", "name mobile email");
 
     if (!quotation) {
       throw new AppError("Quotation not found or not assigned to you", 404);
@@ -730,10 +779,17 @@ export const acceptVendorPo = async (
     quotation.vendorPoAcceptedAt = new Date();
     await quotation.save();
 
+    // Re-fetch with the same vendor-facing exclusion as list/get above —
+    // `quotation` here was loaded WITHOUT that projection (needed the full
+    // doc to validate/mutate vendorRate), so it must not be returned as-is.
+    const redacted = await Quotation.findById(quotation._id).select(
+      VENDOR_QUOTATION_EXCLUDE,
+    );
+
     res.json({
       success: true,
       message: "Purchase order accepted",
-      data: quotation,
+      data: redacted,
     });
   } catch (error) {
     next(error);
@@ -746,16 +802,18 @@ export const quotationCounts = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const [newC, quoted, accepted, rejected, expired] = await Promise.all([
-      Quotation.countDocuments({ status: "new" }),
-      Quotation.countDocuments({ status: "quoted" }),
-      Quotation.countDocuments({ status: "accepted" }),
-      Quotation.countDocuments({ status: "rejected" }),
-      Quotation.countDocuments({ status: "expired" }),
-    ]);
+    const [newC, quoted, accepted, procurement, rejected, expired] =
+      await Promise.all([
+        Quotation.countDocuments({ status: "new" }),
+        Quotation.countDocuments({ status: "quoted" }),
+        Quotation.countDocuments({ status: "accepted" }),
+        Quotation.countDocuments({ status: "procurement" }),
+        Quotation.countDocuments({ status: "rejected" }),
+        Quotation.countDocuments({ status: "expired" }),
+      ]);
     res.json({
       success: true,
-      data: { new: newC, quoted, accepted, rejected, expired },
+      data: { new: newC, quoted, accepted, procurement, rejected, expired },
     });
   } catch (error) {
     next(error);

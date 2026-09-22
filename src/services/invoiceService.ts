@@ -1,6 +1,7 @@
 import Booking from "../models/Booking.model";
 import Invoice, { IInvoiceDocument, InvoiceType } from "../models/Invoice.model";
 import AppSettings from "../models/AppSettings.model";
+import VendorMaterial from "../models/VendorMaterial.model";
 import { buildTaxInvoiceHtml } from "../utils/taxInvoiceHtml";
 
 /**
@@ -19,6 +20,7 @@ export const ensureInvoicesGenerated = async (
     const booking: any = await Booking.findById(bookingId)
       .populate("vendor", "name email mobile business bankDetails")
       .populate("user", "name mobile email address")
+      .populate("material", "gst")
       .lean();
 
     if (!booking) return [];
@@ -85,6 +87,42 @@ export const ensureInvoicesGenerated = async (
       vendor_to_otg: companySnapshot,
     };
 
+    // vendor_to_otg's amount is the vendor's OWN rate for this material
+    // (VendorMaterial.price), not the customer's booking.totalAmount — the
+    // two invoice types must diverge in amount, not just seller identity
+    // (E21-22). If the vendor never set a rate for this material, skip
+    // generating this invoice for now rather than falling back to the
+    // customer's price (that would leak OTG's margin into what's meant to
+    // be the vendor's own procurement invoice) — a later call (invoices are
+    // idempotent per (booking, type)) will generate it once a rate exists.
+    const qty = Number(booking.quantity || 0);
+    const gstRate = Number(booking.material?.gst || 0);
+    let vendorAmount: number | null = null;
+    let vendorGstAmount = 0;
+    if (booking.vendor?._id) {
+      const vm = await VendorMaterial.findOne({
+        vendor: booking.vendor._id,
+        material: booking.material?._id || booking.material,
+      })
+        .select("price")
+        .lean();
+      if (vm) {
+        const subtotal = Number(vm.price || 0) * qty;
+        vendorGstAmount = Math.round(subtotal * (gstRate / 100) * 100) / 100;
+        vendorAmount = Math.round((subtotal + vendorGstAmount) * 100) / 100;
+      }
+    }
+
+    const amounts: Partial<Record<InvoiceType, {amount: number; gstAmount: number}>> = {
+      vendor_to_customer: {
+        amount: booking.totalAmount,
+        gstAmount: Number(booking.gstAmount || 0),
+      },
+    };
+    if (vendorAmount != null) {
+      amounts.vendor_to_otg = { amount: vendorAmount, gstAmount: vendorGstAmount };
+    }
+
     const created: IInvoiceDocument[] = [];
     for (const type of ["vendor_to_customer", "vendor_to_otg"] as InvoiceType[]) {
       const existing = await Invoice.findOne({ booking: booking._id, type });
@@ -92,12 +130,15 @@ export const ensureInvoicesGenerated = async (
         created.push(existing);
         continue;
       }
+      const figures = amounts[type];
+      if (!figures) continue; // vendor_to_otg with no vendor rate set yet
       const invoice = await Invoice.create({
         type,
         booking: booking._id,
         sellerSnapshot: sellerSnapshots[type],
         buyerSnapshot: buyerSnapshots[type],
-        amount: booking.totalAmount,
+        amount: figures.amount,
+        gstAmount: figures.gstAmount,
         generatedBy: "auto",
       });
       created.push(invoice);
@@ -130,7 +171,13 @@ export const renderInvoiceHtml = async (
 
   const qty = Number(booking.quantity || 0);
   const total = Number(invoice.amount || booking.totalAmount || 0);
-  const gstAmount = Number(booking.gstAmount || 0);
+  // Prefer the invoice's own stored gstAmount (correct for both invoice
+  // types since it was computed per-type at generation — see
+  // ensureInvoicesGenerated). Older invoices generated before that field
+  // existed fall back to the booking's customer-side GST, same as before.
+  const gstAmount = Number(
+    invoice.gstAmount != null ? invoice.gstAmount : booking.gstAmount || 0,
+  );
   const basic = Math.max(total - gstAmount, 0);
   const gstRate = Number(material.gst || 0);
   const rate = qty ? basic / qty : basic;

@@ -22,7 +22,21 @@ export interface IUserDocument extends Document {
   addresses?: Array<{
     _id?: mongoose.Types.ObjectId;
     label?: string;
+    // Full address text — kept as the single source other code (e.g.
+    // Booking.buyerDetails.deliveryAddress) expects, composed from the
+    // structured fields below when they're present.
     line?: string;
+    // Structured fields (C13-14) — let a saved site prefill Checkout's
+    // deliveryAddress/landmark/city/pincode individually instead of only a
+    // flattened string. Optional/backward-compatible with older records
+    // that only ever set `line`.
+    houseNo?: string;
+    street?: string;
+    city?: string;
+    state?: string;
+    pincode?: string;
+    landmark?: string;
+    phone?: string;
     lat?: number;
     lng?: number;
     isDefault?: boolean;
@@ -114,6 +128,13 @@ const UserSchema: Schema = new Schema(
         new Schema({
           label: { type: String, trim: true },
           line: { type: String, trim: true },
+          houseNo: { type: String, trim: true },
+          street: { type: String, trim: true },
+          city: { type: String, trim: true },
+          state: { type: String, trim: true },
+          pincode: { type: String, trim: true },
+          landmark: { type: String, trim: true },
+          phone: { type: String, trim: true },
           lat: { type: Number },
           lng: { type: Number },
           isDefault: { type: Boolean, default: false },

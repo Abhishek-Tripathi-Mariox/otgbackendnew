@@ -507,7 +507,8 @@ export const listAddresses = async (
 
 /**
  * Add a saved address (authenticated)
- * POST /api/mobile/auth/addresses  body: { label, line, lat?, lng?, isDefault? }
+ * POST /api/mobile/auth/addresses
+ * body: { label, line, houseNo?, street?, city?, state?, pincode?, landmark?, phone?, lat?, lng?, isDefault? }
  */
 export const addAddress = async (
   req: Request,
@@ -516,7 +517,20 @@ export const addAddress = async (
 ): Promise<void> => {
   try {
     const user = await loadActiveUser((req as any).user?.id);
-    const { label, line, lat, lng, isDefault } = req.body || {};
+    const {
+      label,
+      line,
+      houseNo,
+      street,
+      city,
+      state,
+      pincode,
+      landmark,
+      phone,
+      lat,
+      lng,
+      isDefault,
+    } = req.body || {};
 
     if (!line) throw new AppError("Address line is required", 400);
 
@@ -533,6 +547,13 @@ export const addAddress = async (
     user.addresses.push({
       label: label || undefined,
       line,
+      houseNo: houseNo || undefined,
+      street: street || undefined,
+      city: city || undefined,
+      state: state || undefined,
+      pincode: pincode || undefined,
+      landmark: landmark || undefined,
+      phone: phone || undefined,
       lat: typeof lat === "number" ? lat : undefined,
       lng: typeof lng === "number" ? lng : undefined,
       isDefault: makeDefault,
@@ -557,13 +578,33 @@ export const updateAddress = async (
   try {
     const user = await loadActiveUser((req as any).user?.id);
     const { addrId } = req.params;
-    const { label, line, lat, lng, isDefault } = req.body || {};
+    const {
+      label,
+      line,
+      houseNo,
+      street,
+      city,
+      state,
+      pincode,
+      landmark,
+      phone,
+      lat,
+      lng,
+      isDefault,
+    } = req.body || {};
 
     const addr = (user.addresses as any)?.id?.(addrId);
     if (!addr) throw new AppError("Address not found", 404);
 
     if (label !== undefined) addr.label = label || undefined;
     if (line !== undefined) addr.line = line;
+    if (houseNo !== undefined) addr.houseNo = houseNo || undefined;
+    if (street !== undefined) addr.street = street || undefined;
+    if (city !== undefined) addr.city = city || undefined;
+    if (state !== undefined) addr.state = state || undefined;
+    if (pincode !== undefined) addr.pincode = pincode || undefined;
+    if (landmark !== undefined) addr.landmark = landmark || undefined;
+    if (phone !== undefined) addr.phone = phone || undefined;
     if (lat !== undefined) addr.lat = typeof lat === "number" ? lat : undefined;
     if (lng !== undefined) addr.lng = typeof lng === "number" ? lng : undefined;
 

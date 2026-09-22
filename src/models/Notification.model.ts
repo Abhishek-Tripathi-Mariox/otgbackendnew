@@ -26,6 +26,14 @@ export interface INotification extends Document {
   // apps navigate straight to the relevant order on tap. Absent for
   // non-order notifications (admin broadcasts).
   booking?: mongoose.Types.ObjectId;
+  // Same idea as `booking` above, for a notification about a Quotation
+  // (new bulk order, customer acceptance, etc.) — lets the admin bell
+  // dropdown deep-link to the specific quotation rather than a generic list.
+  quotation?: mongoose.Types.ObjectId;
+  // Same idea again, for a notification about a Vendor (material added,
+  // rate change, etc.) — lets the admin bell dropdown deep-link to that
+  // vendor's materials page.
+  vendor?: mongoose.Types.ObjectId;
   // Optional product photo (e.g. first image of the material in a new-order
   // notification) shown alongside the notification in the app.
   image?: string;
@@ -85,6 +93,8 @@ const notificationSchema = new Schema<INotification>(
     pushSent: { type: Number, default: 0 },
     pushFailed: { type: Number, default: 0 },
     booking: { type: Schema.Types.ObjectId, ref: "Booking", default: null },
+    quotation: { type: Schema.Types.ObjectId, ref: "Quotation", default: null },
+    vendor: { type: Schema.Types.ObjectId, ref: "Vendor", default: null },
     image: { type: String, trim: true },
     createdBy: {
       type: Schema.Types.ObjectId,

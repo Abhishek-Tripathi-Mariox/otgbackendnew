@@ -5,6 +5,13 @@ export interface NotifyAdminOptions {
   title: string;
   message: string;
   booking?: mongoose.Types.ObjectId | string;
+  // Set when this notification concerns a Quotation rather than (or in
+  // addition to) a Booking — lets the bell dropdown deep-link to the right
+  // record type instead of always assuming a booking.
+  quotation?: mongoose.Types.ObjectId | string;
+  // Set when this notification concerns a Vendor (material added, rate
+  // change) — lets the bell dropdown deep-link to that vendor's materials.
+  vendor?: mongoose.Types.ObjectId | string;
   image?: string;
   // Who/what triggered this (a User/Vendor/Driver id, or omitted for a
   // purely system-triggered event e.g. "no driver available"). Notification
@@ -29,6 +36,8 @@ export const notifyAdmin = async (opts: NotifyAdminOptions): Promise<void> => {
       status: "sent",
       sentAt: new Date(),
       booking: opts.booking,
+      quotation: opts.quotation,
+      vendor: opts.vendor,
       image: opts.image,
       createdBy: opts.createdBy || SYSTEM_ID,
       readByAdmin: false,

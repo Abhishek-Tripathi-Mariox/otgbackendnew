@@ -15,6 +15,7 @@ import {
   rejectVehicleDocument,
   getDriverStats,
 } from "../controllers/driver.controller";
+import { getCodReconciliation } from "../controllers/adminCod.controller";
 import { authenticate } from "../middlewares/auth.middleware";
 
 const router = Router();
@@ -22,6 +23,8 @@ const router = Router();
 router.use(authenticate);
 
 router.get("/stats", getDriverStats);
+// COD reconciliation (D17) — admin-wide view across all drivers.
+router.get("/cod-reconciliation", getCodReconciliation);
 router.get("/", getDrivers);
 router.get("/:id", getDriver);
 router.put("/:id", updateDriver);

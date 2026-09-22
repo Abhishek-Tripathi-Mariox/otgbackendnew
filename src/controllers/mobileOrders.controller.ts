@@ -3,6 +3,8 @@ import jwt from "jsonwebtoken";
 import Booking, { isCodPaymentMethod, IBuyerDetails, pushStatus } from "../models/Booking.model";
 import Material from "../models/Material.model";
 import User from "../models/User.model";
+import Vendor from "../models/Vendor.model";
+import VendorMaterial from "../models/VendorMaterial.model";
 import Payment from "../models/Payment.model";
 import Transaction from "../models/Transaction.model";
 import AppSettings from "../models/AppSettings.model";
@@ -15,7 +17,7 @@ import {
 } from "../services/offerEngine";
 import { recordOfferRedemption } from "./mobileOffers.controller";
 import { buildTaxInvoiceHtml } from "../utils/taxInvoiceHtml";
-import { findMatchingVendors, notifyVendors } from "../services/vendorNotify";
+import { notifyVendors } from "../services/vendorNotify";
 import { notifyAdmin } from "../services/adminNotify";
 import { refund as refundRazorpayPayment } from "../services/razorpayService";
 
@@ -78,6 +80,13 @@ export interface CheckoutItem {
   materialId: string;
   quantity: number;
   gstAmount?: number;
+  // Vendor the customer explicitly chose for this line via the region/
+  // pincode comparison screen (Section I / F28-34) — when present, the
+  // resulting Booking is bound to this vendor at creation and never
+  // auto-reassigned. Omitted lines fall back to admin manually assigning a
+  // vendor later (the existing admin Bookings vendor picker) — there is no
+  // more vendor claim-race fallback.
+  vendorId?: string;
 }
 
 export interface CartLine {
@@ -88,6 +97,7 @@ export interface CartLine {
   lineDiscount: number;
   convenienceFee: number;
   totalAmount: number;
+  vendorId?: string;
 }
 
 /**
@@ -180,19 +190,70 @@ export const computeCartPricing = async (
     offerForRedemption = offer;
   }
 
+  // Validate any customer-selected vendors (Section I) up front — a vendor
+  // chosen on the comparison screen (Phase 6) must still actually stock this
+  // material, be approved, and be active by the time checkout happens (it
+  // may have changed in the meantime). Reject clearly rather than silently
+  // dropping the selection, since "your selected vendor" is a promise made
+  // to the customer on the previous screen.
+  const requestedVendorIds = Array.from(
+    new Set(items.map((it) => (it as any).vendorId).filter(Boolean)),
+  ) as string[];
+  const validVendorMaterialPairs = new Set<string>();
+  if (requestedVendorIds.length > 0) {
+    const [activeVendors, stockingEntries] = await Promise.all([
+      Vendor.find({
+        _id: { $in: requestedVendorIds },
+        status: "active",
+        approvalStatus: "approved",
+        isDeleted: false,
+      })
+        .select("_id")
+        .lean(),
+      VendorMaterial.find({
+        vendor: { $in: requestedVendorIds },
+        material: { $in: materialIds },
+        isAvailable: true,
+        verificationStatus: "approved",
+      })
+        .select("vendor material")
+        .lean(),
+    ]);
+    const activeVendorIds = new Set(activeVendors.map((v) => String(v._id)));
+    stockingEntries.forEach((s) => {
+      if (activeVendorIds.has(String(s.vendor))) {
+        validVendorMaterialPairs.add(`${s.vendor}:${s.material}`);
+      }
+    });
+  }
+
   const rawLines = items
     .map((it) => {
       const m = matMap.get(it.materialId);
       if (!m) return null;
       const quantity = Math.max(m.minOrderQty || 1, Number(it.quantity) || 1);
       const price = m.finalSellingPrice ?? m.sellingPrice ?? 0;
-      return { material: m, quantity, price, gross: price * quantity };
+      const requestedVendorId = (it as any).vendorId as string | undefined;
+      let vendorId: string | undefined;
+      if (requestedVendorId) {
+        if (
+          !validVendorMaterialPairs.has(`${requestedVendorId}:${m._id}`)
+        ) {
+          throw new AppError(
+            `Your selected vendor for ${m.name} is no longer available. Please choose again.`,
+            400,
+          );
+        }
+        vendorId = requestedVendorId;
+      }
+      return { material: m, quantity, price, gross: price * quantity, vendorId };
     })
     .filter(Boolean) as Array<{
     material: any;
     quantity: number;
     price: number;
     gross: number;
+    vendorId?: string;
   }>;
   const grossTotal = rawLines.reduce((s, l) => s + l.gross, 0) || 1;
 
@@ -247,6 +308,7 @@ export const computeCartPricing = async (
       lineDiscount: +lineDiscount.toFixed(2),
       convenienceFee,
       totalAmount,
+      vendorId: line.vendorId,
     });
     grandTotal += totalAmount;
   }
@@ -284,11 +346,16 @@ export const createBookingsFromPricing = async (
   for (const line of lines) {
     const bookingId = await generateBookingId();
 
+    // Section I (Phase 7): a customer-selected vendor is bound at creation
+    // and never auto-reassigned or fanned out to other vendors to "claim" —
+    // a line with no selection stays unassigned for admin to allocate
+    // manually (the existing admin Bookings vendor picker), same as it does
+    // today after an admin un-assigns a vendor.
     const booking = await Booking.create({
       bookingId,
       user: userId,
       material: line.material._id,
-      vendor: undefined,
+      vendor: line.vendorId || undefined,
       quantity: line.quantity,
       unit: line.material.unit,
       price: line.price,
@@ -318,21 +385,28 @@ export const createBookingsFromPricing = async (
     throw new AppError("Could not create any orders from the cart.", 400);
   }
 
-  if (deliveryPincode) {
-    const matchingVendorIds = await findMatchingVendors(deliveryPincode);
-    if (matchingVendorIds.length > 0) {
-      // Link to the first booking (common single-line-cart case) and its
-      // material's first image, so the vendor app can deep-link and show a
-      // product photo on this notification.
-      const firstBooking = created[0];
-      await notifyVendors(matchingVendorIds, {
-        title: "New order available",
-        message: `A new order is available in your area (pincode ${deliveryPincode}). Accept it before another vendor does.`,
-        booking: firstBooking?._id,
-        image: firstBooking?.material?.images?.[0],
-        createdBy: userId,
-      });
-    }
+  // Notify exactly the vendor(s) the customer actually selected — no more
+  // fan-out to every pincode-matching vendor to race for it.
+  for (const b of created as any[]) {
+    if (!b.vendor) continue;
+    await notifyVendors([b.vendor], {
+      title: "New order assigned to you",
+      message: `Order ${b.bookingId} has been placed with you. Tap to view.`,
+      booking: b._id,
+      image: b.material?.images?.[0],
+      createdBy: userId,
+    });
+  }
+
+  // Any line left unassigned needs admin to pick a vendor manually.
+  const unassignedCount = (created as any[]).filter((b) => !b.vendor).length;
+  if (unassignedCount > 0) {
+    notifyAdmin({
+      title: "Order needs a vendor assigned",
+      message: `${unassignedCount} new order${unassignedCount > 1 ? "s" : ""} placed without a vendor selection (pincode ${deliveryPincode || "n/a"}) — please assign a vendor.`,
+      booking: (created as any[]).find((b) => !b.vendor)?._id,
+      createdBy: userId,
+    }).catch(() => {});
   }
 
   notifyAdmin({
@@ -384,6 +458,9 @@ export const listMyOrders = async (
           "packed",
           "dispatched",
           "in_transit",
+          // Needs admin resolution, not a final state — still "ongoing" from
+          // the customer's point of view (Section I / Phase 7).
+          "vendor_rejected",
         ],
       };
     } else if (status === "past") {

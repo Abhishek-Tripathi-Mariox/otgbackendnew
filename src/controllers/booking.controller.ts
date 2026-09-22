@@ -297,6 +297,13 @@ export const allocateVendor = async (
         throw new AppError("Vendor not found or inactive.", 400);
       }
       booking.vendor = vendor._id as any;
+      // Section I (Phase 7) manual resolution: reassigning a vendor to an
+      // order the previous vendor rejected gives the new vendor a fresh
+      // "pending" order to accept, rather than leaving it stuck showing
+      // "vendor_rejected" even though someone is now assigned.
+      if (booking.status === "vendor_rejected") {
+        pushStatus(booking, "pending", "Reassigned to a new vendor by admin");
+      }
     } else {
       // Allow explicit un-assignment with vendorId: null
       booking.vendor = null;

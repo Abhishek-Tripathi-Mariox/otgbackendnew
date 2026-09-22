@@ -13,6 +13,18 @@ export interface IQuotationItem {
   quotedPrice?: number;
 }
 
+// One snapshot of a prior quote — pushed onto quoteHistory right before
+// respondToQuotation overwrites the live quotedPrice/quotedValidTill/
+// adminNotes fields, so every revision is preserved with its own timestamp
+// instead of being silently destroyed.
+export interface IQuoteHistoryEntry {
+  quotedPrice?: number | null;
+  quotedValidTill?: Date | null;
+  adminNotes?: string;
+  respondedBy?: mongoose.Types.ObjectId | null;
+  respondedAt?: Date | null;
+}
+
 export interface IQuotationDocument extends Document {
   quotationCode: string;
   user?: mongoose.Types.ObjectId;
@@ -35,17 +47,42 @@ export interface IQuotationDocument extends Document {
   unit?: string;
   materialRequirement?: string;
 
-  // Admin response (overall)
-  status: "new" | "quoted" | "accepted" | "rejected" | "expired";
+  // Admin response (overall). "procurement" = customer has accepted and the
+  // order has moved to backend/procurement handling (set instead of just
+  // "accepted" when setMyQuotationStatus processes an acceptance).
+  status:
+    | "new"
+    | "quoted"
+    | "accepted"
+    | "procurement"
+    | "rejected"
+    | "expired";
   quotedPrice?: number;
   quotedCurrency?: string;
   quotedValidTill?: Date;
   adminNotes?: string;
   respondedBy?: mongoose.Types.ObjectId;
   respondedAt?: Date;
-  
-  // Uploaded quotation document (PDF stored on S3)
+  // Every PRIOR quote revision, oldest first — see respondToQuotation. The
+  // live quotedPrice/quotedValidTill/adminNotes/respondedBy/respondedAt
+  // fields above always hold the CURRENT (latest) quote.
+  quoteHistory?: IQuoteHistoryEntry[];
+
+  // Customer's own uploaded RFQ/specification PDF, set once at createQuotation
+  // time. Deliberately a SEPARATE slot from otgQuotationPdf below — admin's
+  // formal quote-back document used to overwrite (and S3-delete) whatever
+  // was here, destroying the customer's original file. Never written to by
+  // uploadQuotationPdf.
   quotationPdf?: {
+    url: string;
+    name?: string;
+    uploadedAt?: Date;
+  } | null;
+
+  // Admin's formal quotation document sent back to the customer, set by
+  // uploadQuotationPdf. Independent of quotationPdf (the customer's own
+  // upload) — the two must never share a slot.
+  otgQuotationPdf?: {
     url: string;
     name?: string;
     uploadedAt?: Date;
@@ -67,6 +104,16 @@ export interface IQuotationDocument extends Document {
   createdAt: Date;
   updatedAt: Date;
 }
+
+const pdfSubSchema = () =>
+  new Schema(
+    {
+      url: { type: String, trim: true },
+      name: { type: String, trim: true },
+      uploadedAt: { type: Date, default: Date.now },
+    },
+    { _id: false },
+  );
 
 const QuotationSchema: Schema = new Schema(
   {
@@ -145,7 +192,7 @@ const QuotationSchema: Schema = new Schema(
 
     status: {
       type: String,
-      enum: ["new", "quoted", "accepted", "rejected", "expired"],
+      enum: ["new", "quoted", "accepted", "procurement", "rejected", "expired"],
       default: "new",
       index: true,
     },
@@ -159,16 +206,32 @@ const QuotationSchema: Schema = new Schema(
       default: null,
     },
     respondedAt: { type: Date, default: null },
+    quoteHistory: {
+      type: [
+        new Schema(
+          {
+            quotedPrice: { type: Number, default: null },
+            quotedValidTill: { type: Date, default: null },
+            adminNotes: { type: String, trim: true },
+            respondedBy: {
+              type: Schema.Types.ObjectId,
+              ref: "Admin",
+              default: null,
+            },
+            respondedAt: { type: Date, default: null },
+          },
+          { _id: false, timestamps: false },
+        ),
+      ],
+      default: [],
+    },
 
     quotationPdf: {
-      type: new Schema(
-        {
-          url: { type: String, trim: true },
-          name: { type: String, trim: true },
-          uploadedAt: { type: Date, default: Date.now },
-        },
-        { _id: false },
-      ),
+      type: pdfSubSchema(),
+      default: null,
+    },
+    otgQuotationPdf: {
+      type: pdfSubSchema(),
       default: null,
     },
 

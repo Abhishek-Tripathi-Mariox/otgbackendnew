@@ -4,8 +4,10 @@ import Category from "../models/Category.model";
 import SubCategory from "../models/SubCategory.model";
 import Material from "../models/Material.model";
 import VendorMaterial from "../models/VendorMaterial.model";
+import Vendor from "../models/Vendor.model";
 import { VendorRequest } from "../middlewares/vendorAuth.middleware";
 import { AppError } from "../middlewares/errorHandler";
+import { notifyAdmin } from "../services/adminNotify";
 
 // GET /api/vendor/inventory/categories
 export const listCategories = async (
@@ -279,6 +281,14 @@ export const addMyMaterial = async (
       },
     );
 
+    const vendorDoc = await Vendor.findById(vendorId).select("name vendorCode");
+    notifyAdmin({
+      title: "Vendor added a new material",
+      message: `${vendorDoc?.name || "A vendor"} (${vendorDoc?.vendorCode || vendorId}) added "${material.name}" — pending your approval before it's visible to customers.`,
+      vendor: vendorId,
+      createdBy: vendorId,
+    });
+
     res.status(201).json({
       success: true,
       message:
@@ -313,7 +323,15 @@ export const updateMyMaterial = async (
     const vm = await VendorMaterial.findOne({ _id: id, vendor: vendorId });
     if (!vm) throw new AppError("Vendor material not found", 404);
 
-    if (price !== undefined) vm.price = price;
+    // Rate changes go through admin approval (E24-26) — never applied
+    // immediately. Everything else (availability, order qty, specs, images)
+    // is the vendor's own listing detail and applies right away.
+    let rateChangeSubmitted = false;
+    if (price !== undefined && Number(price) !== vm.price) {
+      vm.pendingPrice = price;
+      vm.pendingPriceRequestedAt = new Date();
+      rateChangeSubmitted = true;
+    }
     if (quantity !== undefined) vm.quantity = quantity;
     if (minOrderQty !== undefined) vm.minOrderQty = minOrderQty;
     if (maxOrderQty !== undefined) vm.maxOrderQty = maxOrderQty;
@@ -324,6 +342,20 @@ export const updateMyMaterial = async (
 
     await vm.save();
 
+    if (rateChangeSubmitted) {
+      const vendorDoc = await Vendor.findById(vendorId).select("name vendorCode");
+      const populatedMaterial = await VendorMaterial.findById(vm._id).populate(
+        "material",
+        "name",
+      );
+      notifyAdmin({
+        title: "Vendor requested a rate change",
+        message: `${vendorDoc?.name || "A vendor"} (${vendorDoc?.vendorCode || vendorId}) wants to change the rate for "${(populatedMaterial as any)?.material?.name || "a material"}" from ₹${vm.price} to ₹${vm.pendingPrice} — pending your approval.`,
+        vendor: vendorId,
+        createdBy: vendorId,
+      });
+    }
+
     const populated = await VendorMaterial.findById(vm._id).populate({
       path: "material",
       populate: [
@@ -332,7 +364,13 @@ export const updateMyMaterial = async (
       ],
     });
 
-    res.json({ success: true, data: populated });
+    res.json({
+      success: true,
+      message: rateChangeSubmitted
+        ? "Listing updated. Your rate change is pending admin approval."
+        : undefined,
+      data: populated,
+    });
   } catch (error) {
     next(error);
   }

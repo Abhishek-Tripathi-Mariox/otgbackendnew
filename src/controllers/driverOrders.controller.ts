@@ -80,6 +80,8 @@ const formatBooking = (booking: any, stage?: "dispatch" | "early") => {
     codAmount: isCodPaymentMethod(booking.paymentMethod)
       ? booking.totalAmount || 0
       : 0,
+    podPhotoUrl: booking.podPhotoUrl || null,
+    podCapturedAt: booking.podCapturedAt || null,
     ...(stage ? { stage } : {}),
   };
 };
@@ -319,6 +321,7 @@ export const updateOrderStatus = async (
         );
       }
       booking.podPhotoUrl = podPhotoUrl;
+      booking.podCapturedAt = new Date();
       // pushStatus stamps deliveryDate = now on delivery.
       pushStatus(booking, "delivered", "Delivered");
       // COD cash changes hands right here — the customer's payment is now

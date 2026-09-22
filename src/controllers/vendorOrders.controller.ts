@@ -5,6 +5,7 @@ import Booking, { pushStatus } from "../models/Booking.model";
 import Vendor from "../models/Vendor.model";
 import Driver from "../models/Driver.model";
 import Material from "../models/Material.model";
+import VendorMaterial from "../models/VendorMaterial.model";
 import { AppError } from "../middlewares/errorHandler";
 import { VendorRequest } from "../middlewares/vendorAuth.middleware";
 import {
@@ -13,7 +14,6 @@ import {
 } from "../utils/vendorAllocation";
 import { uploadBufferToS3 } from "../config/s3";
 import { buildTaxInvoiceHtml } from "../utils/taxInvoiceHtml";
-import { findMatchingVendors, notifyVendors } from "../services/vendorNotify";
 import { sendPush } from "../services/pushService";
 import { notifyAdmin } from "../services/adminNotify";
 
@@ -57,6 +57,10 @@ const RAW_TO_UI: Record<string, UiStatus> = {
   in_transit: "In Transit",
   delivered: "Delivered",
   cancelled: "Cancelled",
+  // Vendor rejected their assigned order — from the vendor's own point of
+  // view this is functionally the same as cancelled (their involvement is
+  // over); admin resolution (Phase 7 / Section I) happens on the admin side.
+  vendor_rejected: "Cancelled",
 };
 
 // Reverse map for the ?status= list filter. Each UI label maps to the set of
@@ -71,7 +75,7 @@ const UI_TO_RAW: Partial<Record<UiStatus, string[]>> = {
   Dispatched: ["dispatched"],
   "In Transit": ["in_transit"],
   Delivered: ["delivered"],
-  Cancelled: ["cancelled"],
+  Cancelled: ["cancelled", "vendor_rejected"],
   // Matches the Dashboard's own "In Progress" stat card definition
   // (vendorAuth.controller.ts's IN_PROGRESS_STATUSES) — accepted work not
   // yet dispatched.
@@ -131,8 +135,11 @@ const formatBooking = (booking: any) => {
     location: booking.site || "",
     materialName: material?.name || "",
     materialImage: material?.images?.[0] || null,
-    price: booking.price,
-    totalAmount: booking.totalAmount,
+    // `booking.price`/`totalAmount` are the CUSTOMER's paid price — never
+    // exposed to the vendor app (access-control requirement: vendor must
+    // never see OTG's price to the customer). Once Phase 5's real
+    // Vendor→OTG rate (VendorMaterial.price) is wired into invoicing, a
+    // vendor-appropriate `vendorAmount` can be added here instead.
     paymentStatus: booking.paymentStatus,
     paymentMethod: booking.paymentMethod || "",
     notes: booking.notes || "",
@@ -152,7 +159,7 @@ const populateBooking = (q: any) =>
   q
     .populate({
       path: "material",
-      select: "name images unit category",
+      select: "name images unit category gst",
       populate: { path: "category", select: "name" },
     })
     .populate("user", "name mobile");
@@ -191,11 +198,9 @@ export const listMyOrders = async (
       isDeleted: false,
     };
 
-    let rawList: string[] | null = null;
     if (statusParam && statusParam !== "All Orders") {
       const list = UI_TO_RAW[statusParam as UiStatus];
       if (list && list.length) {
-        rawList = list;
         assigned.status = { $in: list };
       }
       if (statusParam === "Today's Dispatch") {
@@ -207,42 +212,12 @@ export const listMyOrders = async (
       }
     }
 
-    const orConds: any[] = [assigned];
-
-    // Unassigned "claimable" orders whose delivery pincode matches this
-    // vendor's business pincode. Shown under "All Orders" or the Pending tab.
-    const showClaimable =
-      statusParam === "All Orders" || (rawList?.includes("pending") ?? false);
-    let claimablePincode = "";
-    if (showClaimable) {
-      const vendorDoc = await Vendor.findById(vendorId)
-        .select("business.pincode approvalStatus")
-        .lean();
-      const vendorPincode = (
-        String(vendorDoc?.business?.pincode ?? "").match(/\d{6}/) || []
-      )[0];
-      // Only approved vendors are offered claimable orders.
-      if (vendorPincode && vendorDoc?.approvalStatus === "approved") {
-        claimablePincode = vendorPincode;
-        orConds.push({
-          vendor: null,
-          isDeleted: false,
-          status: "pending",
-          // Match the 6-digit pincode even if stored with spaces / different format.
-          pincode: new RegExp(vendorPincode),
-        });
-      }
-    }
-
+    // Section I (Phase 7): a vendor only ever sees orders already bound to
+    // them — no more "claimable" unassigned orders shown by pincode match.
+    // Vendor assignment now happens at checkout (customer selection) or via
+    // explicit admin allocation, never by a vendor claiming it themselves.
     const bookings = await populateBooking(
-      Booking.find({ $or: orConds }).sort({ createdAt: -1 }).limit(100),
-    );
-
-    const claimableCount = bookings.filter(
-      (b: any) => !b.vendor && b.status === "pending",
-    ).length;
-    console.log(
-      `[vendorOrders:list] vendor=${vendorId} pincode="${claimablePincode}" status="${statusParam}" total=${bookings.length} claimable=${claimableCount}`,
+      Booking.find(assigned).sort({ createdAt: -1 }).limit(100),
     );
 
     res.json({
@@ -271,28 +246,13 @@ export const getMyOrder = async (
       ? [{ _id: raw }, { bookingId: raw.toUpperCase() }]
       : [{ bookingId: raw.toUpperCase() }];
 
-    const vendorDoc = await Vendor.findById(vendorId)
-      .select("business.pincode")
-      .lean();
-    const vendorPincode = (
-      String(vendorDoc?.business?.pincode ?? "").match(/\d{6}/) || []
-    )[0];
-
-    // Visible if assigned to this vendor OR a claimable (unassigned, pending,
-    // matching-pincode) order.
-    const ownership: any[] = [{ vendor: new mongoose.Types.ObjectId(vendorId) }];
-    if (vendorPincode) {
-      ownership.push({
-        vendor: null,
-        status: "pending",
-        pincode: new RegExp(vendorPincode),
-      });
-    }
-
+    // Section I (Phase 7): only visible if already bound to this vendor — no
+    // more claimable-by-pincode fallback.
     const booking = await populateBooking(
       Booking.findOne({
         isDeleted: false,
-        $and: [{ $or: idQuery }, { $or: ownership }],
+        vendor: new mongoose.Types.ObjectId(vendorId),
+        $or: idQuery,
       }),
     );
 
@@ -340,69 +300,21 @@ export const updateOrderStatus = async (
 
     const vendorObjId = new mongoose.Types.ObjectId(vendorId);
 
-    // Find the order regardless of assignment so we can either act on our own
-    // order or claim an unassigned one.
-    const booking = await Booking.findOne({ isDeleted: false, $or: idQuery });
+    // Section I (Phase 7): a vendor only ever acts on an order already bound
+    // to them — there is no more unassigned order to claim.
+    const booking = await Booking.findOne({
+      isDeleted: false,
+      vendor: vendorObjId,
+      $or: idQuery,
+    });
     if (!booking) throw new AppError("Order not found", 404);
 
-    const isAssignedToMe =
-      booking.vendor && String(booking.vendor) === String(vendorId);
-    const isClaimable = !booking.vendor && booking.status === "pending";
-
     if (action === "accept") {
-      if (isClaimable) {
-        // First-come-first-serve: atomically claim only if still unassigned.
-        // Whoever wins the race gets vendor set; everyone else gets null back.
-        const now = new Date();
-        const claimed = await Booking.findOneAndUpdate(
-          { _id: booking._id, vendor: null, status: "pending" },
-          {
-            $set: { vendor: vendorObjId, status: "accepted" },
-            $push: { statusHistory: { status: "accepted", at: now } },
-          },
-          { new: true },
-        );
-        if (!claimed) {
-          throw new AppError(
-            "This order was already taken by another vendor.",
-            409,
-          );
-        }
-
-        // Tell the other vendors who were originally notified about this
-        // order that it's no longer available, so their claimable list and
-        // notifications clear instead of them finding out only on next poll.
-        if (claimed.pincode) {
-          const otherVendorIds = await findMatchingVendors(claimed.pincode, [
-            vendorObjId,
-          ]);
-          await notifyVendors(otherVendorIds, {
-            title: "Order no longer available",
-            message: "An order in your area has been claimed by another vendor.",
-            booking: claimed._id,
-            createdBy: vendorObjId,
-          });
-        }
-
-        const populated = await populateBooking(
-          Booking.findById(claimed._id),
-        );
-        res.json({ success: true, data: formatBooking(populated) });
-        return;
-      }
-      if (!isAssignedToMe) {
-        throw new AppError("This order is not available to you.", 403);
-      }
       if (booking.status !== "pending") {
         throw new AppError("Only pending orders can be accepted.", 400);
       }
       pushStatus(booking, "accepted");
     } else if (action === "reject") {
-      // A vendor can only reject an order already assigned to them. Unclaimed
-      // orders are simply ignored (another vendor may still take them).
-      if (!isAssignedToMe) {
-        throw new AppError("This order is not assigned to you.", 403);
-      }
       // Rejection is allowed through QC/packing too (e.g. damaged goods
       // discovered during QC) — only once it's actually left the vendor
       // (dispatched/in_transit/delivered) is it too late to reject.
@@ -427,30 +339,23 @@ export const updateOrderStatus = async (
         booking.notes = `${booking.notes ? booking.notes + "\n" : ""}Rejected: ${tag}${reason || ""}`.trim();
       }
 
-      // Try to reopen the order for other eligible (matching pincode,
-      // approved, not-yet-rejected-by) vendors instead of hard-cancelling —
-      // only fall back to cancelling if nobody else is left to offer it to.
-      const remainingVendorIds = booking.pincode
-        ? await findMatchingVendors(booking.pincode, booking.rejectedByVendors)
-        : [];
-
-      if (remainingVendorIds.length > 0) {
-        booking.vendor = null;
-        pushStatus(
-          booking,
-          "pending",
-          reason ? `Declined by vendor: ${reason}` : "Declined by vendor",
-        );
-        await notifyVendors(remainingVendorIds, {
-          title: "New order available",
-          message:
-            "A previously-claimed order in your area is available again. Accept it before another vendor does.",
-          booking: booking._id,
-          createdBy: vendorObjId,
-        });
-      } else {
-        pushStatus(booking, "cancelled", reason);
-      }
+      // Per the client's explicit requirement: a customer's selected vendor
+      // rejecting an order must NOT auto-transfer to another vendor, auto-
+      // cancel, or auto-refund. `booking.vendor` stays as-is (an audit trail
+      // of who rejected) — admin resolves case-by-case via the existing
+      // admin Bookings vendor picker (reassign) or the cancellation flow
+      // (cancel + refund).
+      pushStatus(
+        booking,
+        "vendor_rejected",
+        reason ? `Declined by vendor: ${reason}` : "Declined by vendor",
+      );
+      notifyAdmin({
+        title: "Vendor rejected an order — needs your attention",
+        message: `Order ${booking.bookingId} was rejected by the assigned vendor${reason ? `: ${reason}` : ""}. Reassign a vendor or cancel the order.`,
+        booking: booking._id,
+        createdBy: vendorObjId,
+      }).catch(() => {});
     }
 
     await booking.save({ validateModifiedOnly: true });
@@ -565,11 +470,6 @@ export const getOrderCounts = async (
   }
 };
 
-// Default GST rate for construction-materials line items. If the vendor has a
-// GSTIN on file we surface a tax breakup; if not, we present the invoice as
-// pre-tax only (still legitimate for non-registered vendors).
-const DEFAULT_GST_RATE = 18;
-
 /**
  * GET /api/vendor/orders/:id/invoice
  * Returns a fully-resolved invoice payload for the given booking — vendor
@@ -618,20 +518,27 @@ export const getOrderInvoice = async (
 
     const unit = booking.unit || material?.unit || "";
     const quantity = Number(booking.quantity) || 0;
-    const unitPrice = Number(booking.price) || 0;
-    const total = Number(booking.totalAmount) || quantity * unitPrice;
 
-    const hasGst = Boolean(vendorDoc.business?.gstNumber);
-    // Treat `totalAmount` as the gross (tax-inclusive) amount when the vendor
-    // is GST-registered; otherwise treat it as the flat total.
-    let subtotal = total;
-    let gstRate = 0;
-    let gstAmount = 0;
-    if (hasGst) {
-      gstRate = DEFAULT_GST_RATE;
-      subtotal = +(total / (1 + gstRate / 100)).toFixed(2);
-      gstAmount = +(total - subtotal).toFixed(2);
-    }
+    // This is the VENDOR's own invoice — it must be priced off the vendor's
+    // own rate for this material (VendorMaterial.price, the Vendor→OTG
+    // rate), never the customer's paid price (`booking.price`/
+    // `totalAmount`), and taxed at the material's real GST rate, not a
+    // hardcoded guess.
+    const vendorMaterial = material?._id
+      ? await VendorMaterial.findOne({
+          vendor: new mongoose.Types.ObjectId(vendorId),
+          material: material._id,
+        })
+          .select("price")
+          .lean()
+      : null;
+    const rateSet = vendorMaterial?.price != null;
+    const unitPrice = rateSet ? Number(vendorMaterial!.price) : 0;
+    const gstRate = Number(material?.gst) || 0;
+
+    const subtotal = +(unitPrice * quantity).toFixed(2);
+    const gstAmount = +((subtotal * gstRate) / 100).toFixed(2);
+    const total = +(subtotal + gstAmount).toFixed(2);
 
     const invoiceNo = `INV-${booking.bookingId}`;
     const issuedAt = booking.updatedAt || booking.createdAt;
@@ -676,6 +583,7 @@ export const getOrderInvoice = async (
           gstRate,
           gstAmount,
           total,
+          rateSet,
         },
         notes: booking.notes || null,
       },
@@ -1067,13 +975,27 @@ export const getVendorInvoiceHtml = async (
     const cust = booking.user || {};
 
     const qty = Number(booking.quantity || 0);
-    const total = Number(booking.totalAmount || 0);
-    const gstAmount = Number(booking.gstAmount || 0);
-    const basic = Math.max(total - gstAmount, 0);
+
+    // Vendor's own invoice must be priced off the vendor's own rate
+    // (VendorMaterial.price, the Vendor→OTG rate) — never the customer's
+    // paid price (booking.totalAmount/gstAmount), which is what this used
+    // to read (a confirmed access-control/billing-logic bug: the vendor's
+    // "invoice" was silently just the customer's total).
+    const vendorMaterial = material?._id
+      ? await VendorMaterial.findOne({
+          vendor: new mongoose.Types.ObjectId(vendorId),
+          material: material._id,
+        })
+          .select("price")
+          .lean()
+      : null;
+    const rate = vendorMaterial?.price != null ? Number(vendorMaterial.price) : 0;
     const gstRate = Number(material.gst || 0);
+    const basic = +(rate * qty).toFixed(2);
+    const gstAmount = +((basic * gstRate) / 100).toFixed(2);
     const cgst = gstAmount / 2;
     const sgst = gstAmount / 2;
-    const rate = qty ? basic / qty : basic;
+    const total = +(basic + gstAmount).toFixed(2);
     const issued = new Date(booking.createdAt).toLocaleDateString("en-IN");
     const vendorName = biz.name || vendor.name || "Vendor Name";
 
