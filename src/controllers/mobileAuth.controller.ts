@@ -688,3 +688,71 @@ export const logout = async (
     next(error);
   }
 };
+
+/**
+ * POST /api/mobile/auth/documents
+ *
+ * Uploads a customer business document (today: the certificate of
+ * incorporation that company customers attach at checkout) and returns its
+ * public URL. The caller then stores that URL on buyerDetails — the same
+ * two-step shape the vendor onboarding documents already use, which keeps
+ * the checkout payload plain JSON instead of multipart.
+ *
+ * Accepts either a multipart "file" field (what the mobile app sends, since
+ * React Native's FormData streams a file uri directly) or a base64 body,
+ * mirroring updateProfile's profileImageBase64 path.
+ */
+export const uploadCustomerDocument = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const user = await loadActiveUser((req as any).user?.id);
+    if (!user) return;
+
+    const file = (req as any).file as
+      | (Express.Multer.File & { location?: string })
+      | undefined;
+    if (file?.location) {
+      res.json({
+        success: true,
+        message: "Document uploaded",
+        data: { url: file.location, name: file.originalname },
+      });
+      return;
+    }
+
+    const { fileBase64, fileType, fileName } = req.body as {
+      fileBase64?: string;
+      fileType?: string;
+      fileName?: string;
+    };
+
+    if (!fileBase64) {
+      throw new AppError("Please attach a file", 400);
+    }
+
+    const allowed = ["application/pdf", "image/jpeg", "image/jpg", "image/png"];
+    const mimeType = fileType || "application/pdf";
+    if (!allowed.includes(mimeType)) {
+      throw new AppError("Only PDF, JPG or PNG files are allowed", 400);
+    }
+
+    const buffer = Buffer.from(fileBase64, "base64");
+    // 10MB, matching the PDF upload limit used elsewhere.
+    if (buffer.length > 10 * 1024 * 1024) {
+      throw new AppError("File must be 10MB or smaller", 400);
+    }
+
+    const url = await uploadBufferToS3(buffer, "customer-documents", mimeType);
+
+    res.json({
+      success: true,
+      message: "Document uploaded",
+      data: { url, name: fileName },
+    });
+  } catch (error) {
+    next(error);
+  }
+};

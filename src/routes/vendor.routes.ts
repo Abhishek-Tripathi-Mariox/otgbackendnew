@@ -17,6 +17,7 @@ import {
   updateVendorMaterial,
   approveVendorRateChange,
   rejectVendorRateChange,
+  setVendorMaterialVerification,
   removeVendorMaterial,
   toggleVendorMaterialAvailability,
   getStates,
@@ -84,6 +85,12 @@ router.post(
 router.post(
   "/:vendorId/materials/:materialId/rate-change/reject",
   rejectVendorRateChange,
+);
+
+// Approve / reject a vendor-ADDED material (verificationStatus gate)
+router.post(
+  "/:vendorId/materials/:materialId/verification",
+  setVendorMaterialVerification,
 );
 
 // Remove material from vendor

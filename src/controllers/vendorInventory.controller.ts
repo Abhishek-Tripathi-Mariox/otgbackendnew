@@ -83,8 +83,11 @@ export const listMaterials = async (
 
     const [materials, total] = await Promise.all([
       Material.find(query)
+        // mrp/sellingPrice/basicPrice are OTG's CUSTOMER-facing prices and
+        // must never reach a vendor — they would expose OTG's margin on
+        // every item the vendor supplies.
         .select(
-          "name images brand category subCategory unit minOrderQty mrp sellingPrice basicPrice",
+          "name images brand category subCategory unit minOrderQty",
         )
         .populate("category", "name")
         .populate("subCategory", "name")
@@ -123,10 +126,13 @@ export const listMyMaterials = async (
     const query: any = { vendor: vendorId };
 
     const vendorMaterials = await VendorMaterial.find(query)
+      // A vendor must never see the OTG -> Customer rate (their own margin
+      // exposure). `price`/`pendingPrice` — their own rate — stay visible.
+      .select("-customerPrice")
       .populate({
         path: "material",
-        select:
-          "name images brand category subCategory unit mrp sellingPrice basicPrice",
+        // Customer-facing price fields deliberately omitted — see above.
+        select: "name images brand category subCategory unit",
         populate: [
           { path: "category", select: "name image" },
           { path: "subCategory", select: "name image" },
@@ -271,15 +277,16 @@ export const addMyMaterial = async (
       verificationStatus: "pending",
     });
 
-    const populated = await VendorMaterial.findById(vendorMaterial._id).populate(
-      {
+    const populated = await VendorMaterial.findById(vendorMaterial._id)
+      .select("-customerPrice")
+      .populate({
         path: "material",
+        select: "name images brand category subCategory unit",
         populate: [
           { path: "category", select: "name image" },
           { path: "subCategory", select: "name image" },
         ],
-      },
-    );
+      });
 
     const vendorDoc = await Vendor.findById(vendorId).select("name vendorCode");
     notifyAdmin({
@@ -356,13 +363,16 @@ export const updateMyMaterial = async (
       });
     }
 
-    const populated = await VendorMaterial.findById(vm._id).populate({
-      path: "material",
-      populate: [
-        { path: "category", select: "name image" },
-        { path: "subCategory", select: "name image" },
-      ],
-    });
+    const populated = await VendorMaterial.findById(vm._id)
+      .select("-customerPrice")
+      .populate({
+        path: "material",
+        select: "name images brand category subCategory unit",
+        populate: [
+          { path: "category", select: "name image" },
+          { path: "subCategory", select: "name image" },
+        ],
+      });
 
     res.json({
       success: true,

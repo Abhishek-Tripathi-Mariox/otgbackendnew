@@ -15,10 +15,24 @@ import { deleteFromS3 } from "../config/s3";
 import { sendMail } from "../services/mailer";
 import { sendPush } from "../services/pushService";
 import { notifyAdmin } from "../services/adminNotify";
+import { findMatchingVendors, notifyVendors } from "../services/vendorNotify";
 import { generateBookingId } from "./mobileOrders.controller";
+
+// Notification.createdBy is required, but a guest quotation has no user to
+// attribute the fan-out to — same sentinel adminNotify uses for system events.
+const SYSTEM_ACTOR_ID = new mongoose.Types.ObjectId("000000000000000000000000");
 
 const normalizeMobile = (m: string): string =>
   String(m || "").replace(/^\+91/, "").replace(/\s+/g, "").trim();
+
+// Bulk quotations are priced in the attached PDF, not as a single number on
+// the form (the admin "Quoted price" input was removed — a bulk quote is a
+// multi-line document, and a lone lump sum was both misleading and
+// unreconcilable against the PDF). When admin sends a quote without typing
+// their own covering note, the customer still needs to be told where the
+// numbers actually are, so this is used as the default `adminNotes`.
+export const DEFAULT_QUOTE_NOTE =
+  "We have shared the quote in PDF format, please review and revert.";
 
 // ===================== CUSTOMER =====================
 
@@ -61,6 +75,7 @@ export const createQuotation = async (
       company,
       address,
       landmark,
+      pincode,
       items,
       category,
       quantity,
@@ -108,6 +123,10 @@ export const createQuotation = async (
         }
       : undefined;
 
+    const explicitPin = String(pincode || "").match(/\d{6}/)?.[0];
+    const addressPin = String(address || "").match(/\d{6}/)?.[0];
+    const deliveryPincode = explicitPin || addressPin || "";
+
     const quotation = await Quotation.create({
       user: req.user?.id || undefined,
       customerType: customerType || "individual",
@@ -117,6 +136,9 @@ export const createQuotation = async (
       company: company?.trim() || undefined,
       address: address?.trim() || undefined,
       landmark: landmark?.trim() || undefined,
+      // Prefer an explicit pincode; fall back to the first 6-digit run in
+      // the free-text address, same convention as the orders flow.
+      pincode: deliveryPincode || undefined,
       items: cleanedItems,
       // Legacy fallbacks (only filled if items[] not provided)
       category: cleanedItems.length === 0 && category?.trim()
@@ -158,6 +180,23 @@ export const createQuotation = async (
       quotation: quotation._id,
       createdBy: quotation.user || undefined,
     }).catch(() => {});
+
+    // Fan the request out to vendors who serve this pincode so they can get
+    // ready to quote. They see only the request itself — assignment, the
+    // vendor rate and the PO still come later from admin, and no
+    // customer-facing price exists on a brand-new quotation anyway.
+    if (deliveryPincode) {
+      findMatchingVendors(deliveryPincode)
+        .then((vendorIds) =>
+          notifyVendors(vendorIds, {
+            title: "New bulk order in your area",
+            message: `A bulk requirement (${quotation.quotationCode}) was raised for pincode ${deliveryPincode}.`,
+            quotation: quotation._id,
+            createdBy: quotation.user || SYSTEM_ACTOR_ID,
+          }),
+        )
+        .catch(() => {});
+    }
 
     res.status(201).json({
       success: true,
@@ -462,6 +501,11 @@ export const respondToQuotation = async (
     }
     if (quotedValidTill) quotation.quotedValidTill = new Date(quotedValidTill);
     if (adminNotes !== undefined) quotation.adminNotes = adminNotes;
+    // The quote itself lives in the attached PDF, so a quotation must never
+    // reach the customer with no explanation of where to find the numbers.
+    if (!String(quotation.adminNotes || "").trim()) {
+      quotation.adminNotes = DEFAULT_QUOTE_NOTE;
+    }
     quotation.status = "quoted";
     quotation.respondedBy = new mongoose.Types.ObjectId(req.admin!._id);
     quotation.respondedAt = new Date();
@@ -541,6 +585,107 @@ export const uploadQuotationPdf = async (
   }
 };
 
+// Admin uploads (or replaces) the OTG -> Customer tax invoice for a bulk
+// order. Kept separate from uploadQuotationPdf so the formal quote and the
+// final invoice each keep their own slot — replacing one must never destroy
+// the other (the same mistake otgQuotationPdf was split out to avoid).
+export const uploadQuotationInvoicePdf = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const file = req.file as Express.Multer.File & { location?: string };
+
+    if (!file || !file.location) {
+      throw new AppError("Please attach a PDF file", 400);
+    }
+
+    const quotation = await Quotation.findById(id);
+    if (!quotation) throw new AppError("Quotation not found", 404);
+
+    if (quotation.invoicePdf?.url) {
+      await deleteFromS3(quotation.invoicePdf.url);
+    }
+
+    quotation.invoicePdf = {
+      url: file.location,
+      name: file.originalname,
+      uploadedAt: new Date(),
+    };
+    await quotation.save();
+
+    res.json({
+      success: true,
+      message: "Invoice uploaded",
+      data: quotation,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Admin manually closes out a bulk order. Bulk orders are negotiated and
+// fulfilled offline, so no automatic signal can mark them done — unlike a
+// retail Booking, which reaches "delivered" through the driver app.
+export const markQuotationCompleted = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { id } = req.params;
+
+    const quotation = await Quotation.findById(id);
+    if (!quotation) throw new AppError("Quotation not found", 404);
+
+    if (quotation.status === "completed") {
+      throw new AppError("This bulk order is already completed", 400);
+    }
+    // Only a live order can be completed — a request the customer never
+    // accepted, or explicitly rejected, has nothing to complete.
+    if (!["accepted", "procurement"].includes(quotation.status)) {
+      throw new AppError(
+        "Only an accepted bulk order can be marked completed",
+        400,
+      );
+    }
+
+    quotation.status = "completed";
+    quotation.completedAt = new Date();
+    quotation.completedBy = new mongoose.Types.ObjectId(req.admin!._id);
+    await quotation.save();
+
+    // Tell the customer their bulk order is closed, deep-linking to the
+    // same My Quotations entry the quote notification points at.
+    if (quotation.user) {
+      User.findById(quotation.user)
+        .select("deviceInfo.fcmToken")
+        .lean()
+        .then((user) => {
+          const token = user?.deviceInfo?.fcmToken;
+          if (!token) return;
+          return sendPush(
+            [token],
+            "Bulk order completed",
+            `Your bulk order ${quotation.quotationCode} has been marked completed — tap to view.`,
+            { quotationId: String(quotation._id) },
+          );
+        })
+        .catch(() => {});
+    }
+
+    res.json({
+      success: true,
+      message: "Bulk order marked completed",
+      data: quotation,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 export const updateQuotationStatus = async (
   req: AuthRequest,
   res: Response,
@@ -557,6 +702,7 @@ export const updateQuotationStatus = async (
       "procurement",
       "rejected",
       "expired",
+      "completed",
     ];
     if (!allowed.includes(status)) {
       throw new AppError("Invalid status", 400);
@@ -569,6 +715,10 @@ export const updateQuotationStatus = async (
     if (status === "quoted") {
       quotation.respondedBy = new mongoose.Types.ObjectId(req.admin!._id);
       quotation.respondedAt = new Date();
+    }
+    if (status === "completed" && !quotation.completedAt) {
+      quotation.completedAt = new Date();
+      quotation.completedBy = new mongoose.Types.ObjectId(req.admin!._id);
     }
     await quotation.save();
 
@@ -698,7 +848,7 @@ export const assignVendorToQuotation = async (
 // vendor-facing quotation read so the confidential data never reaches the
 // wire, not just the UI.
 const VENDOR_QUOTATION_EXCLUDE =
-  "-quotedPrice -items.quotedPrice -quotedCurrency -quotedValidTill -adminNotes -otgQuotationPdf -quoteHistory";
+  "-quotedPrice -items.quotedPrice -quotedCurrency -quotedValidTill -adminNotes -otgQuotationPdf -quoteHistory -invoicePdf";
 
 export const listVendorQuotations = async (
   req: VendorRequest,
@@ -802,7 +952,7 @@ export const quotationCounts = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const [newC, quoted, accepted, procurement, rejected, expired] =
+    const [newC, quoted, accepted, procurement, rejected, expired, completed] =
       await Promise.all([
         Quotation.countDocuments({ status: "new" }),
         Quotation.countDocuments({ status: "quoted" }),
@@ -810,10 +960,19 @@ export const quotationCounts = async (
         Quotation.countDocuments({ status: "procurement" }),
         Quotation.countDocuments({ status: "rejected" }),
         Quotation.countDocuments({ status: "expired" }),
+        Quotation.countDocuments({ status: "completed" }),
       ]);
     res.json({
       success: true,
-      data: { new: newC, quoted, accepted, procurement, rejected, expired },
+      data: {
+        new: newC,
+        quoted,
+        accepted,
+        procurement,
+        rejected,
+        expired,
+        completed,
+      },
     });
   } catch (error) {
     next(error);

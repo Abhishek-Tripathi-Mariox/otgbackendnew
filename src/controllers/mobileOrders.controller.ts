@@ -200,6 +200,10 @@ export const computeCartPricing = async (
     new Set(items.map((it) => (it as any).vendorId).filter(Boolean)),
   ) as string[];
   const validVendorMaterialPairs = new Set<string>();
+  // "<vendorId>:<materialId>" -> that vendor's own OTG -> Customer rate.
+  // Only populated where admin has set one; otherwise the master catalog
+  // price applies, exactly as before this field existed.
+  const vendorCustomerPrice = new Map<string, number>();
   if (requestedVendorIds.length > 0) {
     const [activeVendors, stockingEntries] = await Promise.all([
       Vendor.find({
@@ -216,13 +220,21 @@ export const computeCartPricing = async (
         isAvailable: true,
         verificationStatus: "approved",
       })
-        .select("vendor material")
+        // customerPrice = the OTG -> Customer rate for this specific vendor.
+        // `price` (Vendor -> OTG cost) is deliberately not selected here.
+        .select("vendor material customerPrice")
         .lean(),
     ]);
     const activeVendorIds = new Set(activeVendors.map((v) => String(v._id)));
     stockingEntries.forEach((s) => {
       if (activeVendorIds.has(String(s.vendor))) {
         validVendorMaterialPairs.add(`${s.vendor}:${s.material}`);
+        if ((s as any).customerPrice != null) {
+          vendorCustomerPrice.set(
+            `${s.vendor}:${s.material}`,
+            Number((s as any).customerPrice),
+          );
+        }
       }
     });
   }
@@ -232,7 +244,7 @@ export const computeCartPricing = async (
       const m = matMap.get(it.materialId);
       if (!m) return null;
       const quantity = Math.max(m.minOrderQty || 1, Number(it.quantity) || 1);
-      const price = m.finalSellingPrice ?? m.sellingPrice ?? 0;
+      let price = m.finalSellingPrice ?? m.sellingPrice ?? 0;
       const requestedVendorId = (it as any).vendorId as string | undefined;
       let vendorId: string | undefined;
       if (requestedVendorId) {
@@ -245,6 +257,10 @@ export const computeCartPricing = async (
           );
         }
         vendorId = requestedVendorId;
+        // Charge the rate the customer was shown for THIS vendor on the
+        // comparison screen, so picking a cheaper vendor actually costs less.
+        const vendorRate = vendorCustomerPrice.get(`${requestedVendorId}:${m._id}`);
+        if (vendorRate != null) price = vendorRate;
       }
       return { material: m, quantity, price, gross: price * quantity, vendorId };
     })

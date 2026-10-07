@@ -11,9 +11,22 @@ export interface IRateChangeHistoryEntry {
 export interface IVendorMaterialDocument extends Document {
   vendor: mongoose.Types.ObjectId;
   material: mongoose.Types.ObjectId;
-  // The vendor's own rate (what OTG pays the vendor) — see E21-22. Never
-  // changed directly by a vendor-submitted edit; see pendingPrice below.
+  // Vendor -> OTG rate: what OTG PAYS the vendor. Drives the vendor_to_otg
+  // invoice. Never changed directly by a vendor-submitted edit; see
+  // pendingPrice below. Confidential to the customer side.
   price: number;
+  // OTG -> Customer rate: what the customer PAYS for this material when they
+  // buy it from THIS vendor. Deliberately a separate field from `price` so a
+  // vendor rate change never moves the customer-facing price (requirement:
+  // "Vendor -> OTG rate change should NOT automatically change the
+  // OTG -> Customer selling rate" — admin owns this number).
+  //
+  // Optional: when null the customer price falls back to the master
+  // catalog's `Material.finalSellingPrice`, which is exactly what every
+  // existing row did before this field existed, so untouched data keeps its
+  // current behaviour. Only admin may write it — it must never be exposed
+  // to, or settable by, the vendor.
+  customerPrice?: number | null;
   // A vendor-submitted rate change awaiting admin approval (E24-26). `price`
   // stays at its last-approved value until admin approves, so billing/
   // invoicing never reads an unapproved rate. Admin-direct edits (via the
@@ -53,6 +66,11 @@ const VendorMaterialSchema: Schema = new Schema(
       type: Number,
       required: [true, "Price is required"],
       min: [0, "Price cannot be negative"],
+    },
+    customerPrice: {
+      type: Number,
+      min: [0, "Price cannot be negative"],
+      default: null,
     },
     pendingPrice: {
       type: Number,

@@ -13,11 +13,25 @@ import { AppError } from "../middlewares/errorHandler";
 // exists, so this is a simple, honest heuristic pending real routing data.
 const DELIVERY_TIER_NEAR_KM = 10;
 const DELIVERY_TIER_FAR_KM = 25;
-const deliveryEstimateForDistance = (km: number | null): string | null => {
-  if (km == null) return null;
+const deliveryEstimateForDistance = (
+  km: number | null,
+  samePincode = false,
+): string | null => {
+  // A vendor whose own business pincode IS the delivery pincode is local by
+  // definition, so they get the fast tier even when geocoding gave us no
+  // distance — otherwise the exact-pincode fallback path showed no ETA for
+  // anyone, which is the case customers hit most often.
+  if (km == null) {
+    return samePincode
+      ? "Delivers within 2 hours"
+      : "Delivery time confirmed on order";
+  }
   if (km <= DELIVERY_TIER_NEAR_KM) return "Delivers within 2 hours";
   if (km <= DELIVERY_TIER_FAR_KM) return "Delivers within 4 hours";
-  return null;
+  // Beyond the 4-hour tier we genuinely cannot promise an hour count, but
+  // every option still needs to show a delivery line — so say the honest
+  // thing rather than leaving the field blank.
+  return "Delivery time confirmed on order";
 };
 
 // GET /api/mobile/categories - Get all active categories
@@ -271,13 +285,26 @@ export const getMaterialVendors = async (
       isAvailable: true,
       verificationStatus: "approved",
     })
-      .select("vendor price minOrderQty maxOrderQty")
+      // NOTE: `price` here is the Vendor -> OTG cost rate and must NEVER be
+      // returned to a customer. The customer-facing number is
+      // `customerPrice`, falling back to the master catalog price below.
+      .select("vendor price customerPrice minOrderQty maxOrderQty")
       .lean();
 
     if (stocking.length === 0) {
       res.json({ success: true, data: [] });
       return;
     }
+
+    // Master-catalog selling price, used whenever a vendor has no explicit
+    // OTG -> Customer rate of their own (which is every pre-existing row).
+    const material = await Material.findById(id)
+      .select("finalSellingPrice sellingPrice")
+      .lean();
+    const catalogPrice =
+      (material as any)?.finalSellingPrice ??
+      (material as any)?.sellingPrice ??
+      null;
 
     const vendorIds = stocking.map((s) => s.vendor);
     const rateByVendor = new Map(stocking.map((s) => [String(s.vendor), s]));
@@ -331,23 +358,34 @@ export const getMaterialVendors = async (
         const rate = rateByVendor.get(String(v._id));
         const distanceKm =
           v.distanceMeters != null ? +(v.distanceMeters / 1000).toFixed(1) : null;
+        // Vendors whose own business pincode matches the delivery pincode
+        // rank above everyone else — the $geoNear branch queries by distance
+        // only and otherwise happily returns a nationwide list.
+        const samePincode = String(v.business?.pincode || "").includes(pin);
         return {
           vendorId: v._id,
           vendorName: v.business?.name || v.name || "Vendor",
-          price: rate?.price ?? null,
+          // Customer-facing price only. `rate.price` (Vendor -> OTG) is
+          // deliberately NOT exposed here — it is OTG's cost and margin.
+          price: rate?.customerPrice ?? catalogPrice,
           minOrderQty: rate?.minOrderQty ?? 1,
           maxOrderQty: rate?.maxOrderQty ?? null,
           distanceKm,
-          deliveryEstimate: deliveryEstimateForDistance(distanceKm),
+          samePincode,
+          deliveryEstimate: deliveryEstimateForDistance(distanceKm, samePincode),
         };
       })
       .filter((r) => r.price != null)
       .sort((a, b) => {
+        // 1) same-pincode vendors first
+        if (a.samePincode !== b.samePincode) return a.samePincode ? -1 : 1;
+        // 2) then nearest first (vendors with a known distance outrank ones
+        //    whose location has never been pinned)
         if (a.distanceKm != null && b.distanceKm != null) {
-          return a.distanceKm - b.distanceKm;
-        }
-        if (a.distanceKm != null) return -1;
-        if (b.distanceKm != null) return 1;
+          if (a.distanceKm !== b.distanceKm) return a.distanceKm - b.distanceKm;
+        } else if (a.distanceKm != null) return -1;
+        else if (b.distanceKm != null) return 1;
+        // 3) finally cheapest first
         return (a.price ?? 0) - (b.price ?? 0);
       });
 

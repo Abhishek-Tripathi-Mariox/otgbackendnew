@@ -95,6 +95,10 @@ export interface IBuyerDetails {
   pan?: string;
   billingAddress?: string;
   registeredOfficeAddress?: string;
+  // S3 URL of the company's certificate of incorporation, uploaded via
+  // POST /api/mobile/auth/documents. Optional — many small contractors have
+  // no such certificate, so checkout must not hard-require it.
+  incorporationCertificate?: string;
   companyType?: CompanyType;
   projectName?: string;
   siteAddress?: string;
@@ -146,6 +150,7 @@ export const buyerDetailsSchemaFields = {
   pan: { type: String, trim: true, uppercase: true },
   billingAddress: { type: String, trim: true },
   registeredOfficeAddress: { type: String, trim: true },
+  incorporationCertificate: { type: String, trim: true },
   companyType: {
     type: String,
     enum: ["Contractor", "Builder", "Developer", "Consultant", "Government", "Individual"],

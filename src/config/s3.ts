@@ -112,6 +112,39 @@ export const createPdfUpload = (
   });
 };
 
+// File filter for customer/vendor paperwork: a scanned certificate is just
+// as often a photo as a PDF, so accept both rather than forcing a conversion.
+const documentFileFilter = (
+  req: Express.Request,
+  file: Express.Multer.File,
+  cb: multer.FileFilterCallback,
+) => {
+  const allowed = [
+    "application/pdf",
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+  ];
+  if (allowed.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error("Invalid file type. Only PDF, JPG or PNG files are allowed."));
+  }
+};
+
+export const createDocumentUpload = (
+  folder: string,
+  maxSize: number = 10 * 1024 * 1024,
+) => {
+  return multer({
+    storage: createS3Storage(folder),
+    fileFilter: documentFileFilter,
+    limits: {
+      fileSize: maxSize,
+    },
+  });
+};
+
 // Delete file from S3
 export const deleteFromS3 = async (fileUrl: string): Promise<boolean> => {
   try {

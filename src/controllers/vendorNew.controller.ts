@@ -213,6 +213,24 @@ export const getVendorsByLocation = async (
   }
 };
 
+// Build the GeoJSON `location` sub-document from a loose {longitude,
+// latitude, address} payload. Returns `undefined` when either ordinate is
+// missing or non-numeric: the 2dsphere index cannot extract keys from a
+// Point with empty coordinates (it rejects the whole insert), whereas a
+// document with no `location` at all is simply skipped by the index — and
+// by the $geoNear vendor search, which is the correct behaviour for a
+// vendor whose shop has not been pinned on the map yet.
+const buildVendorLocation = (location: any) => {
+  const lng = Number(location?.longitude);
+  const lat = Number(location?.latitude);
+  if (!Number.isFinite(lng) || !Number.isFinite(lat)) return undefined;
+  return {
+    type: "Point" as const,
+    coordinates: [lng, lat],
+    address: location?.address || undefined,
+  };
+};
+
 // Create vendor
 export const createVendor = async (
   req: AuthRequest,
@@ -220,8 +238,16 @@ export const createVendor = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const { name, mobile, email, business, location, status, bankDetails } =
-      req.body;
+    const { name, mobile, email, location, status, bankDetails } = req.body;
+    // `business` and `location` are optional in the request but were
+    // dereferenced unguarded below, so a payload without them crashed with a
+    // 500 instead of a validation error. Business name is the one business
+    // field the vendor record is unusable without.
+    const business = req.body.business || {};
+    if (!business.name) {
+      throw new AppError("Business name is required", 400);
+    }
+
     // Check if vendor with same mobile exists
     const existingVendor = await Vendor.findOne({ mobile, isDeleted: false });
     if (existingVendor) {
@@ -263,11 +289,10 @@ export const createVendor = async (
         state: business.state,
         pincode: business.pincode,
       },
-      location: {
-        type: "Point",
-        coordinates: [location.longitude, location.latitude],
-        address: location.address || undefined,
-      },
+      // Coordinates stay empty unless BOTH are real numbers — the schema only
+      // validates a non-empty coordinate pair, and a half-filled pair would
+      // break the 2dsphere index used by vendor proximity search.
+      location: buildVendorLocation(location),
       bankDetails: {
         accountHolderName: bankDetails.accountHolderName,
         accountNumber: bankDetails.accountNumber,
@@ -738,7 +763,15 @@ export const addVendorMaterial = async (
 ): Promise<void> => {
   try {
     const { vendorId } = req.params;
-    const { materialId, price, minOrderQty, maxOrderQty, isAvailable, specs } =
+    const {
+      materialId,
+      price,
+      customerPrice,
+      minOrderQty,
+      maxOrderQty,
+      isAvailable,
+      specs,
+    } =
       req.body;
 
     // Verify vendor exists
@@ -765,6 +798,11 @@ export const addVendorMaterial = async (
       vendor: vendorId,
       material: materialId,
       price,
+      // OTG -> Customer rate. Optional: when unset the master catalog's
+      // finalSellingPrice applies, which is the pre-existing behaviour.
+      customerPrice: customerPrice === undefined || customerPrice === null || customerPrice === ""
+        ? null
+        : Number(customerPrice),
       minOrderQty: minOrderQty || 1,
       maxOrderQty: maxOrderQty || undefined,
       isAvailable: isAvailable !== false,
@@ -800,7 +838,8 @@ export const updateVendorMaterial = async (
 ): Promise<void> => {
   try {
     const { vendorId, materialId } = req.params;
-    const { price, minOrderQty, maxOrderQty, isAvailable, specs } = req.body;
+    const { price, customerPrice, minOrderQty, maxOrderQty, isAvailable, specs } =
+      req.body;
 
     const vendorMaterial = await VendorMaterial.findOne({
       vendor: vendorId,
@@ -812,6 +851,14 @@ export const updateVendorMaterial = async (
     }
 
     if (price !== undefined) vendorMaterial.price = price;
+    // Admin owns the customer-facing rate; changing the vendor's own `price`
+    // above never moves it (requirement C27).
+    if (customerPrice !== undefined) {
+      vendorMaterial.customerPrice =
+        customerPrice === null || customerPrice === ""
+          ? null
+          : Number(customerPrice);
+    }
     if (minOrderQty !== undefined) vendorMaterial.minOrderQty = minOrderQty;
     if (maxOrderQty !== undefined) vendorMaterial.maxOrderQty = maxOrderQty;
     if (isAvailable !== undefined) vendorMaterial.isAvailable = isAvailable;
@@ -835,6 +882,65 @@ export const updateVendorMaterial = async (
       success: true,
       message: "Vendor material updated successfully",
       data: updatedMaterial,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// POST /api/vendors/:vendorId/materials/:materialId/verification
+// Approves or rejects a material a VENDOR added themselves. Vendor-added
+// materials are created with verificationStatus "pending"
+// (vendorInventory.addMyMaterial) and every customer-facing query filters on
+// "approved" — so without this endpoint such a material could never become
+// visible to customers at all.
+export const setVendorMaterialVerification = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { vendorId, materialId } = req.params;
+    const { status, customerPrice } = req.body;
+
+    if (!["approved", "rejected"].includes(status)) {
+      throw new AppError("Status must be 'approved' or 'rejected'", 400);
+    }
+
+    const vm = await VendorMaterial.findOne({
+      vendor: vendorId,
+      material: materialId,
+    });
+    if (!vm) throw new AppError("Vendor material not found", 404);
+
+    vm.verificationStatus = status;
+    // Approving is the natural moment to set the OTG -> Customer rate, since
+    // admin is deciding what this item should sell for.
+    if (status === "approved" && customerPrice !== undefined) {
+      const num = Number(customerPrice);
+      if (customerPrice !== null && (!Number.isFinite(num) || num < 0)) {
+        throw new AppError("Customer price must be a non-negative number", 400);
+      }
+      vm.customerPrice = customerPrice === null ? null : num;
+    }
+    vm.updatedBy = new mongoose.Types.ObjectId(req.admin!._id);
+    await vm.save({ validateModifiedOnly: true });
+
+    const populated = await VendorMaterial.findById(vm._id).populate({
+      path: "material",
+      populate: [
+        { path: "category", select: "name" },
+        { path: "subCategory", select: "name" },
+      ],
+    });
+
+    res.json({
+      success: true,
+      message:
+        status === "approved"
+          ? "Material approved and now visible to customers"
+          : "Material rejected",
+      data: populated,
     });
   } catch (error) {
     next(error);

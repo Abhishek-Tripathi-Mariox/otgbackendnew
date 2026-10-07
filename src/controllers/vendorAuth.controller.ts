@@ -702,6 +702,11 @@ export const listVendorNotifications = async (
       createdAt: n.createdAt,
       sentAt: n.sentAt,
       booking: n.booking || null,
+      // Needed for the bulk-order deep link — the vendor app routes a
+      // notification with a quotation id to QuotationDetail, the same way it
+      // routes `booking` to OrderDetail. Omitting it left those rows
+      // un-tappable.
+      quotation: n.quotation || null,
       image: n.image || null,
       unread: !(n.readByVendors || []).some((id: any) => id.equals(objectId)),
     }));

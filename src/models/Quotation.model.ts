@@ -37,6 +37,10 @@ export interface IQuotationDocument extends Document {
   company?: string;
   address?: string;
   landmark?: string;
+  // Delivery pincode for the bulk order. Used to fan the request out to
+  // vendors who serve that area (see createQuotation). Captured explicitly
+  // when the app sends it; otherwise parsed out of `address`.
+  pincode?: string;
 
   // Itemised request (new format)
   items: IQuotationItem[];
@@ -50,13 +54,17 @@ export interface IQuotationDocument extends Document {
   // Admin response (overall). "procurement" = customer has accepted and the
   // order has moved to backend/procurement handling (set instead of just
   // "accepted" when setMyQuotationStatus processes an acceptance).
+  // "completed" = admin has manually closed out the bulk order (material
+  // supplied and billed). It is a terminal state set only by markQuotationCompleted
+  // — bulk orders are fulfilled offline, so nothing can derive it automatically.
   status:
     | "new"
     | "quoted"
     | "accepted"
     | "procurement"
     | "rejected"
-    | "expired";
+    | "expired"
+    | "completed";
   quotedPrice?: number;
   quotedCurrency?: string;
   quotedValidTill?: Date;
@@ -87,6 +95,19 @@ export interface IQuotationDocument extends Document {
     name?: string;
     uploadedAt?: Date;
   } | null;
+
+  // The OTG → Customer tax invoice for a completed bulk order, uploaded by
+  // admin via uploadQuotationInvoicePdf. Customer-facing money: like
+  // quotedPrice/otgQuotationPdf it must stay inside VENDOR_QUOTATION_EXCLUDE
+  // so the assigned vendor can never see what OTG billed the customer.
+  invoicePdf?: {
+    url: string;
+    name?: string;
+    uploadedAt?: Date;
+  } | null;
+
+  completedAt?: Date | null;
+  completedBy?: mongoose.Types.ObjectId | null;
 
   // Vendor allocation (admin assigns; assigned vendor sees the request)
   assignedVendor?: mongoose.Types.ObjectId | null;
@@ -150,6 +171,7 @@ const QuotationSchema: Schema = new Schema(
     company: { type: String, trim: true },
     address: { type: String, trim: true },
     landmark: { type: String, trim: true },
+    pincode: { type: String, trim: true, index: true },
 
     items: {
       type: [
@@ -192,7 +214,15 @@ const QuotationSchema: Schema = new Schema(
 
     status: {
       type: String,
-      enum: ["new", "quoted", "accepted", "procurement", "rejected", "expired"],
+      enum: [
+        "new",
+        "quoted",
+        "accepted",
+        "procurement",
+        "rejected",
+        "expired",
+        "completed",
+      ],
       default: "new",
       index: true,
     },
@@ -232,6 +262,17 @@ const QuotationSchema: Schema = new Schema(
     },
     otgQuotationPdf: {
       type: pdfSubSchema(),
+      default: null,
+    },
+    invoicePdf: {
+      type: pdfSubSchema(),
+      default: null,
+    },
+
+    completedAt: { type: Date, default: null },
+    completedBy: {
+      type: Schema.Types.ObjectId,
+      ref: "Admin",
       default: null,
     },
 

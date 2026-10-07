@@ -15,6 +15,8 @@ import {
   deleteQuotation,
   quotationCounts,
   uploadQuotationPdf,
+  uploadQuotationInvoicePdf,
+  markQuotationCompleted,
 } from "../controllers/quotation.controller";
 import { authenticate } from "../middlewares/auth.middleware";
 import { createPdfUpload } from "../config/s3";
@@ -62,6 +64,13 @@ router.patch(
   quotationPdfUpload.single("pdf"),
   uploadQuotationPdf,
 );
+router.patch(
+  "/:id/invoice",
+  authenticate,
+  quotationPdfUpload.single("pdf"),
+  uploadQuotationInvoicePdf,
+);
+router.patch("/:id/complete", authenticate, markQuotationCompleted);
 router.patch("/:id/status", authenticate, updateQuotationStatus);
 router.patch("/:id/assign-vendor", authenticate, assignVendorToQuotation);
 router.delete("/:id", authenticate, deleteQuotation);

@@ -7,14 +7,17 @@ import {
   updateProfile,
   updateFCMToken,
   logout,
+  uploadCustomerDocument,
   listAddresses,
   addAddress,
   updateAddress,
   deleteAddress,
 } from "../controllers/mobileAuth.controller";
 import { authenticateUser } from "../middlewares/userAuth.middleware";
+import { createDocumentUpload } from "../config/s3";
 
 const router = Router();
+const customerDocumentUpload = createDocumentUpload("customer-documents");
 
 // Public routes (no authentication required)
 router.post("/send-otp", sendOTP);
@@ -26,6 +29,14 @@ router.get("/me", authenticateUser, getMe);
 router.put("/profile", authenticateUser, updateProfile);
 router.put("/fcm-token", authenticateUser, updateFCMToken);
 router.post("/logout", authenticateUser, logout);
+
+// Customer business documents (e.g. certificate of incorporation)
+router.post(
+  "/documents",
+  authenticateUser,
+  customerDocumentUpload.single("file"),
+  uploadCustomerDocument,
+);
 
 // Saved addresses (address book)
 router.get("/addresses", authenticateUser, listAddresses);
