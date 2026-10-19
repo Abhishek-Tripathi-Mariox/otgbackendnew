@@ -1,5 +1,7 @@
 import mongoose from "mongoose";
-import VendorMaterial from "../models/VendorMaterial.model";
+import VendorMaterial, {
+  CUSTOMER_VISIBLE_VERIFICATION,
+} from "../models/VendorMaterial.model";
 import Vendor from "../models/Vendor.model";
 import Driver from "../models/Driver.model";
 
@@ -33,7 +35,7 @@ export async function findNearestVendorForMaterial(
   const stocking = await VendorMaterial.find({
     material: materialId,
     isAvailable: true,
-    verificationStatus: "approved",
+    verificationStatus: CUSTOMER_VISIBLE_VERIFICATION,
   })
     .select("vendor")
     .lean();

@@ -1,3 +1,4 @@
+import mongoose from "mongoose";
 import { Request, Response, NextFunction } from "express";
 import Category from "../models/Category.model";
 import Brand from "../models/Brand.model";
@@ -5,7 +6,9 @@ import SubCategory from "../models/SubCategory.model";
 import Material from "../models/Material.model";
 import Banner from "../models/Banner.model";
 import Vendor from "../models/Vendor.model";
-import VendorMaterial from "../models/VendorMaterial.model";
+import VendorMaterial, {
+  CUSTOMER_VISIBLE_VERIFICATION,
+} from "../models/VendorMaterial.model";
 import { searchAddress } from "../services/mapsService";
 import { AppError } from "../middlewares/errorHandler";
 
@@ -13,6 +16,22 @@ import { AppError } from "../middlewares/errorHandler";
 // exists, so this is a simple, honest heuristic pending real routing data.
 const DELIVERY_TIER_NEAR_KM = 10;
 const DELIVERY_TIER_FAR_KM = 25;
+/**
+ * Numeric companion to deliveryEstimateForDistance, so the list can actually
+ * be SORTED by delivery speed. The label alone is a string, which cannot be
+ * ordered meaningfully. `null` means "no committed ETA" and always sorts
+ * last.
+ */
+const deliveryEtaHoursForDistance = (
+  km: number | null,
+  samePincode = false,
+): number | null => {
+  if (km == null) return samePincode ? 2 : null;
+  if (km <= DELIVERY_TIER_NEAR_KM) return 2;
+  if (km <= DELIVERY_TIER_FAR_KM) return 4;
+  return null;
+};
+
 const deliveryEstimateForDistance = (
   km: number | null,
   samePincode = false,
@@ -32,6 +51,59 @@ const deliveryEstimateForDistance = (
   // every option still needs to show a delivery line — so say the honest
   // thing rather than leaving the field blank.
   return "Delivery time confirmed on order";
+};
+
+/**
+ * Resolve the vendors that can serve a delivery pincode, with their distance
+ * where known.
+ *
+ * Shared by the material list's supplier summary and the per-material vendor
+ * comparison so both answer "who can supply me here?" the same way. Geocodes
+ * the pincode to rank by real distance; when that is unavailable (no API key,
+ * network failure, unrecognised pincode) it degrades to matching the vendor's
+ * own business pincode, which is the common case anyway.
+ */
+const resolveVendorsForPincode = async (
+  pin: string,
+  vendorIds: any[],
+): Promise<
+  Array<{ _id: any; name?: string; business?: any; distanceMeters?: number }>
+> => {
+  if (vendorIds.length === 0) return [];
+
+  let coords: [number, number] | null = null;
+  try {
+    const results = await searchAddress(`${pin}, India`);
+    const first = results.find((r) => r.lat && r.lon);
+    if (first) coords = [Number(first.lon), Number(first.lat)];
+  } catch {
+    // fall through to the pincode-string match below
+  }
+
+  const baseQuery = {
+    _id: { $in: vendorIds },
+    status: "active",
+    approvalStatus: "approved",
+    isDeleted: false,
+  };
+
+  if (coords) {
+    return Vendor.aggregate([
+      {
+        $geoNear: {
+          near: { type: "Point", coordinates: coords },
+          distanceField: "distanceMeters",
+          spherical: true,
+          query: baseQuery,
+        },
+      },
+      { $project: { name: 1, business: 1, distanceMeters: 1 } },
+    ]);
+  }
+
+  return Vendor.find({ ...baseQuery, "business.pincode": new RegExp(pin) })
+    .select("name business")
+    .lean();
 };
 
 // GET /api/mobile/categories - Get all active categories
@@ -95,11 +167,26 @@ export const getSubCategories = async (
       status: "active",
     })
       .select("name image category")
-      .sort({ name: 1 });
+      .sort({ name: 1 })
+      .lean();
+
+    // Only surface sub-categories that actually have something to show.
+    // `Material.subCategory` is optional (the admin form marks it so), so a
+    // category can easily carry sub-categories that no material is linked
+    // to. Listing those produced dead filter chips in the customer app — tap
+    // "CEMENT" and get an empty screen even though the category clearly has
+    // cement in it. Hiding the empty ones keeps every chip meaningful.
+    const nonEmptyIds = await Material.distinct("subCategory", {
+      category: id,
+      subCategory: { $in: subCategories.map((s) => s._id) },
+      isDeleted: false,
+      status: "active",
+    });
+    const nonEmpty = new Set(nonEmptyIds.map((v: any) => String(v)));
 
     res.json({
       success: true,
-      data: subCategories,
+      data: subCategories.filter((s: any) => nonEmpty.has(String(s._id))),
     });
   } catch (error) {
     next(error);
@@ -125,6 +212,11 @@ export const getMaterials = async (
     const pageNum = parseInt(page as string, 10);
     const limitNum = parseInt(limit as string, 10);
     const skip = (pageNum - 1) * limitNum;
+
+    // Optional: when present, each listing gains a supplier summary for that
+    // delivery area (see below).
+    const deliveryPin =
+      String(req.query.pincode || "").match(/\d{6}/)?.[0] || null;
 
     const query: any = {
       isDeleted: false,
@@ -188,9 +280,106 @@ export const getMaterials = async (
       Material.countDocuments(query),
     ]);
 
+    // Supplier summary: when the customer tells us where they want delivery,
+    // every listing carries "from <price> · N suppliers · <ETA>" so they can
+    // see availability and the real starting price without opening each
+    // product. Omitted entirely when no pincode is supplied, so existing
+    // callers get exactly the payload they got before.
+    let data: any[] = materials;
+    if (deliveryPin) {
+      const materialIds = materials.map((m: any) => m._id);
+      const stocking = await VendorMaterial.find({
+        material: { $in: materialIds },
+        isAvailable: true,
+        verificationStatus: CUSTOMER_VISIBLE_VERIFICATION,
+      })
+        .select("vendor material customerPrice")
+        .lean();
+
+      const servingVendors = await resolveVendorsForPincode(
+        deliveryPin,
+        Array.from(new Set(stocking.map((s: any) => String(s.vendor)))).map(
+          (v) => new mongoose.Types.ObjectId(v),
+        ),
+      );
+      const distanceByVendor = new Map(
+        servingVendors.map((v: any) => [
+          String(v._id),
+          v.distanceMeters != null ? v.distanceMeters / 1000 : null,
+        ]),
+      );
+      const samePinVendors = new Set(
+        servingVendors
+          .filter((v: any) =>
+            String(v.business?.pincode || "").includes(deliveryPin),
+          )
+          .map((v: any) => String(v._id)),
+      );
+
+      const summaryByMaterial = new Map<
+        string,
+        { count: number; fromPrice: number | null; bestEtaHours: number | null }
+      >();
+
+      stocking.forEach((row: any) => {
+        const vendorKey = String(row.vendor);
+        if (!distanceByVendor.has(vendorKey)) return; // vendor can't serve here
+        const materialKey = String(row.material);
+        const catalog = materials.find(
+          (m: any) => String(m._id) === materialKey,
+        ) as any;
+        const price =
+          row.customerPrice ??
+          catalog?.finalSellingPrice ??
+          catalog?.sellingPrice ??
+          null;
+        if (price == null) return;
+
+        const eta = deliveryEtaHoursForDistance(
+          distanceByVendor.get(vendorKey) ?? null,
+          samePinVendors.has(vendorKey),
+        );
+
+        const current = summaryByMaterial.get(materialKey) || {
+          count: 0,
+          fromPrice: null,
+          bestEtaHours: null,
+        };
+        current.count += 1;
+        current.fromPrice =
+          current.fromPrice == null
+            ? price
+            : Math.min(current.fromPrice, price);
+        if (eta != null) {
+          current.bestEtaHours =
+            current.bestEtaHours == null
+              ? eta
+              : Math.min(current.bestEtaHours, eta);
+        }
+        summaryByMaterial.set(materialKey, current);
+      });
+
+      data = materials.map((m: any) => {
+        const plain = typeof m.toObject === "function" ? m.toObject() : m;
+        const summary = summaryByMaterial.get(String(m._id));
+        return {
+          ...plain,
+          supplierSummary: summary
+            ? {
+                ...summary,
+                bestEtaLabel:
+                  summary.bestEtaHours != null
+                    ? `Delivers within ${summary.bestEtaHours} hours`
+                    : "Delivery time confirmed on order",
+              }
+            : { count: 0, fromPrice: null, bestEtaHours: null, bestEtaLabel: null },
+        };
+      });
+    }
+
     res.json({
       success: true,
-      data: materials,
+      data,
       pagination: {
         page: pageNum,
         limit: limitNum,
@@ -266,6 +455,96 @@ export const getBanners = async (
 // estimate, sorted nearest-first — but NOT filtered to a radius, so a
 // farther, cheaper vendor still shows up for the customer to compare and
 // deliberately choose (F32-34).
+/**
+ * GET /api/mobile/catalog/vendors/:id
+ *
+ * Public storefront for one vendor: who they are and everything they stock
+ * that a customer may buy, so a customer can browse a supplier directly
+ * instead of only meeting them through a single material's comparison list.
+ *
+ * Confidentiality: `VendorMaterial.price` is the Vendor -> OTG COST rate and
+ * is never selected here. The customer sees `customerPrice`, falling back to
+ * the master catalog price — exactly the number checkout will charge.
+ */
+export const getVendorStorefront = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      throw new AppError("Vendor not found", 404);
+    }
+
+    const vendor = await Vendor.findOne({
+      _id: id,
+      status: "active",
+      approvalStatus: "approved",
+      isDeleted: false,
+    })
+      .select("name business.name business.city business.pincode vendorCode")
+      .lean();
+
+    if (!vendor) throw new AppError("Vendor not found", 404);
+
+    const stocking = await VendorMaterial.find({
+      vendor: id,
+      isAvailable: true,
+      verificationStatus: CUSTOMER_VISIBLE_VERIFICATION,
+    })
+      .select("material customerPrice minOrderQty maxOrderQty specs")
+      .populate({
+        path: "material",
+        select:
+          "name images brand category subCategory unit finalSellingPrice sellingPrice gst requestQuote transportation minOrderQty status isDeleted",
+        populate: [
+          { path: "category", select: "name" },
+          { path: "subCategory", select: "name" },
+        ],
+      })
+      .lean();
+
+    const materials = stocking
+      // A vendor row can outlive its master material being delisted.
+      .filter(
+        (row: any) =>
+          row.material &&
+          row.material.status === "active" &&
+          !row.material.isDeleted,
+      )
+      .map((row: any) => {
+        const m = row.material;
+        return {
+          ...m,
+          // The price this vendor sells at — overrides the catalog price.
+          finalSellingPrice:
+            row.customerPrice ?? m.finalSellingPrice ?? m.sellingPrice ?? 0,
+          vendorPrice: row.customerPrice ?? null,
+          minOrderQty: row.minOrderQty ?? m.minOrderQty ?? 1,
+          maxOrderQty: row.maxOrderQty ?? null,
+          specs: row.specs ?? m.specs,
+        };
+      });
+
+    res.json({
+      success: true,
+      data: {
+        vendor: {
+          _id: vendor._id,
+          name: (vendor as any).business?.name || vendor.name,
+          city: (vendor as any).business?.city || null,
+          pincode: (vendor as any).business?.pincode || null,
+        },
+        materials,
+        total: materials.length,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 export const getMaterialVendors = async (
   req: Request,
   res: Response,
@@ -280,10 +559,32 @@ export const getMaterialVendors = async (
     }
     const pin = pinMatch[0];
 
+    // Sorting / filtering controls (F: "filter or sort vendors based on
+    // product prices" and "... on delivery time"). All optional; the default
+    // preserves the previous recommended ordering exactly.
+    const ALLOWED_SORTS = [
+      "recommended",
+      "price_asc",
+      "price_desc",
+      "delivery",
+      "distance",
+    ] as const;
+    const requestedSort = String(req.query.sort || "recommended");
+    const sort = (ALLOWED_SORTS as readonly string[]).includes(requestedSort)
+      ? requestedSort
+      : "recommended";
+
+    const parsePositive = (v: unknown): number | null => {
+      const n = Number(v);
+      return Number.isFinite(n) && n > 0 ? n : null;
+    };
+    const maxPrice = parsePositive(req.query.maxPrice);
+    const maxDeliveryHours = parsePositive(req.query.maxDeliveryHours);
+
     const stocking = await VendorMaterial.find({
       material: id,
       isAvailable: true,
-      verificationStatus: "approved",
+      verificationStatus: CUSTOMER_VISIBLE_VERIFICATION,
     })
       // NOTE: `price` here is the Vendor -> OTG cost rate and must NEVER be
       // returned to a customer. The customer-facing number is
@@ -309,49 +610,7 @@ export const getMaterialVendors = async (
     const vendorIds = stocking.map((s) => s.vendor);
     const rateByVendor = new Map(stocking.map((s) => [String(s.vendor), s]));
 
-    // Try to geocode the pincode to real coordinates so distance/delivery
-    // tiers can be computed; if that fails (no API key configured, network
-    // issue, unrecognized pincode), fall back to exact business-pincode
-    // string matching — same convention as vendorNotify.ts/driverNotify.ts —
-    // with no distance/estimate shown for anyone outside that exact match.
-    let coords: [number, number] | null = null;
-    try {
-      const results = await searchAddress(`${pin}, India`);
-      const first = results.find((r) => r.lat && r.lon);
-      if (first) coords = [Number(first.lon), Number(first.lat)];
-    } catch {
-      // fall through to pincode-string fallback below
-    }
-
-    let vendors: Array<{_id: any; name?: string; business?: any; distanceMeters?: number}>;
-    if (coords) {
-      vendors = await Vendor.aggregate([
-        {
-          $geoNear: {
-            near: { type: "Point", coordinates: coords },
-            distanceField: "distanceMeters",
-            spherical: true,
-            query: {
-              _id: { $in: vendorIds },
-              status: "active",
-              approvalStatus: "approved",
-              isDeleted: false,
-            },
-          },
-        },
-        { $project: { name: 1, business: 1, distanceMeters: 1 } },
-      ]);
-    } else {
-      vendors = await Vendor.find({
-        _id: { $in: vendorIds },
-        status: "active",
-        approvalStatus: "approved",
-        isDeleted: false,
-        "business.pincode": new RegExp(pin),
-      })
-        .select("name business")
-        .lean();
-    }
+    const vendors = await resolveVendorsForPincode(pin, vendorIds);
 
     const results = vendors
       .map((v: any) => {
@@ -373,20 +632,49 @@ export const getMaterialVendors = async (
           distanceKm,
           samePincode,
           deliveryEstimate: deliveryEstimateForDistance(distanceKm, samePincode),
+          deliveryEtaHours: deliveryEtaHoursForDistance(distanceKm, samePincode),
         };
       })
       .filter((r) => r.price != null)
+      // Price ceiling, so "show me options under X" is answerable.
+      .filter((r) => maxPrice == null || (r.price as number) <= maxPrice)
+      // Delivery ceiling: "only vendors who can deliver within N hours".
+      // Vendors with no committed ETA are excluded when a limit is asked
+      // for — an unknown ETA cannot satisfy a promise.
+      .filter(
+        (r) =>
+          maxDeliveryHours == null ||
+          (r.deliveryEtaHours != null && r.deliveryEtaHours <= maxDeliveryHours),
+      )
       .sort((a, b) => {
-        // 1) same-pincode vendors first
+        // Nulls always sink, whatever the chosen ordering.
+        const byPrice = (a.price ?? 0) - (b.price ?? 0);
+        const byEta = () => {
+          const ax = a.deliveryEtaHours;
+          const bx = b.deliveryEtaHours;
+          if (ax == null && bx == null) return 0;
+          if (ax == null) return 1;
+          if (bx == null) return -1;
+          return ax - bx;
+        };
+        const byDistance = () => {
+          if (a.distanceKm != null && b.distanceKm != null) {
+            return a.distanceKm - b.distanceKm;
+          }
+          if (a.distanceKm != null) return -1;
+          if (b.distanceKm != null) return 1;
+          return 0;
+        };
+
+        if (sort === "price_asc") return byPrice || byDistance();
+        if (sort === "price_desc") return -byPrice || byDistance();
+        if (sort === "delivery") return byEta() || byDistance() || byPrice;
+        if (sort === "distance") return byDistance() || byPrice;
+
+        // "recommended" (default): same-pincode first, then nearest, then
+        // cheapest — the ordering the comparison screen has always used.
         if (a.samePincode !== b.samePincode) return a.samePincode ? -1 : 1;
-        // 2) then nearest first (vendors with a known distance outrank ones
-        //    whose location has never been pinned)
-        if (a.distanceKm != null && b.distanceKm != null) {
-          if (a.distanceKm !== b.distanceKm) return a.distanceKm - b.distanceKm;
-        } else if (a.distanceKm != null) return -1;
-        else if (b.distanceKm != null) return 1;
-        // 3) finally cheapest first
-        return (a.price ?? 0) - (b.price ?? 0);
+        return byDistance() || byPrice;
       });
 
     res.json({ success: true, data: results });

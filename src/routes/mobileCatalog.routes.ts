@@ -7,6 +7,7 @@ import {
   getMaterialDetail,
   getBanners,
   getMaterialVendors,
+  getVendorStorefront,
 } from "../controllers/mobileCatalog.controller";
 import {
   getMaterialReviews,
@@ -40,6 +41,9 @@ router.get("/materials/:id", getMaterialDetail);
 // GET /api/mobile/catalog/materials/:id/vendors?pincode= — region/pincode
 // vendor comparison (F28-34).
 router.get("/materials/:id/vendors", getMaterialVendors);
+
+// Vendor storefront — browse one supplier's catalogue directly.
+router.get("/vendors/:id", getVendorStorefront);
 
 // Reviews & ratings for a material
 // GET (public) list + stats; POST (auth) create/update own review

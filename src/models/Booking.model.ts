@@ -448,4 +448,38 @@ export const pushStatus = (
   }
 };
 
+/**
+ * Notify the customer whenever a booking's status actually changes.
+ *
+ * Hooked on the model rather than at each call site on purpose: status is
+ * written from the vendor app, the driver app, the admin panel and the
+ * quotation flow — eleven call sites at last count, two of which already
+ * bypassed `pushStatus`. Centralising it here means a customer cannot stop
+ * being told about their order just because a new code path forgot to call
+ * the notifier.
+ *
+ * `isModified` must be read in a pre-save hook (post-save has already reset
+ * the dirty tracking), so the flag is stashed on `$locals`.
+ */
+BookingSchema.pre("save", function (next) {
+  (this as any).$locals.statusDidChange =
+    !this.isNew && this.isModified("status");
+  next();
+});
+
+BookingSchema.post("save", function (doc: any) {
+  if (!doc?.$locals?.statusDidChange) return;
+  // Imported lazily to keep the model free of a load-time dependency on the
+  // service layer (which itself imports other models).
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { notifyCustomerOrderStatus } = require("../services/customerNotify");
+  // Best-effort: never let a notification failure surface as a save error.
+  notifyCustomerOrderStatus(
+    doc.user,
+    doc._id,
+    doc.status,
+    doc.bookingId,
+  ).catch(() => {});
+});
+
 export default mongoose.model<IBookingDocument>("Booking", BookingSchema);

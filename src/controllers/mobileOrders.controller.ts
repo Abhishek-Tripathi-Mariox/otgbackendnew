@@ -4,7 +4,9 @@ import Booking, { isCodPaymentMethod, IBuyerDetails, pushStatus } from "../model
 import Material from "../models/Material.model";
 import User from "../models/User.model";
 import Vendor from "../models/Vendor.model";
-import VendorMaterial from "../models/VendorMaterial.model";
+import VendorMaterial, {
+  CUSTOMER_VISIBLE_VERIFICATION,
+} from "../models/VendorMaterial.model";
 import Payment from "../models/Payment.model";
 import Transaction from "../models/Transaction.model";
 import AppSettings from "../models/AppSettings.model";
@@ -218,7 +220,7 @@ export const computeCartPricing = async (
         vendor: { $in: requestedVendorIds },
         material: { $in: materialIds },
         isAvailable: true,
-        verificationStatus: "approved",
+        verificationStatus: CUSTOMER_VISIBLE_VERIFICATION,
       })
         // customerPrice = the OTG -> Customer rate for this specific vendor.
         // `price` (Vendor -> OTG cost) is deliberately not selected here.
@@ -731,11 +733,18 @@ const TRACKING_STEPS: Array<{
 // already "done". `confirmed` ranks with `accepted`.
 const STATUS_RANK: Record<string, number> = {
   pending: 0,
+  // A vendor who declines does not move the order forward, but the order HAS
+  // been placed. Without an entry here the lookup fell through to rank 0 and
+  // every step rendered as not-done, so a customer whose vendor rejected saw
+  // a timeline of nothing but "Pending".
+  vendor_rejected: 0,
   accepted: 1,
   confirmed: 1,
   qc_pending: 2,
+  // QC was rejected by admin, so the QC step is explicitly NOT complete —
+  // ranking it alongside qc_approved used to paint it green.
+  qc_rejected: 1,
   qc_approved: 2,
-  qc_rejected: 2,
   packed: 3,
   dispatched: 4,
   in_transit: 5,
@@ -813,11 +822,36 @@ export const getOrderTracking = async (
           }
         : null;
 
+    // A one-line, customer-safe explanation of where the order actually is.
+    // The step list alone cannot express states that sit OUTSIDE the happy
+    // path (vendor declined, QC sent back), which previously left those
+    // orders looking simply "not started".
+    const STATUS_NOTE: Record<string, string> = {
+      pending: "Waiting for the supplier to confirm your order.",
+      vendor_rejected:
+        "Your supplier could not fulfil this order. Our team is assigning a new one.",
+      accepted: "Your supplier has confirmed the order and is preparing it.",
+      qc_pending: "Quality check in progress.",
+      qc_rejected: "Quality check sent back to the supplier for correction.",
+      qc_approved: "Quality check passed.",
+      packed: "Your order is packed and awaiting dispatch.",
+      dispatched: "Your order has been dispatched.",
+      in_transit: "Your order is on its way.",
+      delivered: "Your order has been delivered.",
+      cancelled: "This order was cancelled.",
+    };
+
     res.json({
       success: true,
       data: {
         bookingId: booking.bookingId,
         status: booking.status,
+        statusNote: STATUS_NOTE[booking.status as string] || null,
+        // True for states that need attention rather than just progress, so
+        // the app can style them as a warning instead of a green tick.
+        needsAttention: ["vendor_rejected", "qc_rejected", "cancelled"].includes(
+          booking.status as string,
+        ),
         cancelled,
         steps,
         driver,

@@ -185,7 +185,13 @@ export const updateBooking = async (
       throw new AppError("Booking not found.", 404);
     }
 
-    if (status) booking.status = status;
+    // Route through pushStatus rather than assigning directly: a raw
+    // assignment advanced `status` without appending to `statusHistory`,
+    // which left the customer's tracking timeline showing a completed step
+    // with no timestamp (rendered as "Pending").
+    if (status && status !== booking.status) {
+      pushStatus(booking, status, "Updated by admin");
+    }
     if (paymentStatus) booking.paymentStatus = paymentStatus;
     if (notes !== undefined) booking.notes = notes;
     if (site !== undefined) booking.site = site;

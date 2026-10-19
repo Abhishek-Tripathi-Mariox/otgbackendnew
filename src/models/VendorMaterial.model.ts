@@ -161,6 +161,19 @@ VendorMaterialSchema.index({ material: 1, isAvailable: 1 });
 VendorMaterialSchema.index({ price: 1 });
 VendorMaterialSchema.index({ addedByVendor: 1, verificationStatus: 1 });
 
+/**
+ * Matches vendor-material rows that are cleared to be shown to customers.
+ *
+ * Deliberately "not pending and not rejected" rather than `=== "approved"`:
+ * rows created before `verificationStatus` existed have no value for the
+ * field at all, and an equality filter silently hid that stock from search,
+ * comparison and checkout. The schema default is "approved", so a missing
+ * value means the same thing as approved.
+ */
+export const CUSTOMER_VISIBLE_VERIFICATION = {
+  $nin: ["pending", "rejected"],
+};
+
 export default mongoose.model<IVendorMaterialDocument>(
   "VendorMaterial",
   VendorMaterialSchema,
