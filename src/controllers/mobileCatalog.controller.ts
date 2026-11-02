@@ -67,7 +67,13 @@ const resolveVendorsForPincode = async (
   pin: string,
   vendorIds: any[],
 ): Promise<
-  Array<{ _id: any; name?: string; business?: any; distanceMeters?: number }>
+  Array<{
+    _id: any;
+    name?: string;
+    vendorCode?: string;
+    business?: any;
+    distanceMeters?: number;
+  }>
 > => {
   if (vendorIds.length === 0) return [];
 
@@ -97,12 +103,12 @@ const resolveVendorsForPincode = async (
           query: baseQuery,
         },
       },
-      { $project: { name: 1, business: 1, distanceMeters: 1 } },
+      { $project: { name: 1, vendorCode: 1, business: 1, distanceMeters: 1 } },
     ]);
   }
 
   return Vendor.find({ ...baseQuery, "business.pincode": new RegExp(pin) })
-    .select("name business")
+    .select("name vendorCode business")
     .lean();
 };
 
@@ -217,6 +223,14 @@ export const getMaterials = async (
     // delivery area (see below).
     const deliveryPin =
       String(req.query.pincode || "").match(/\d{6}/)?.[0] || null;
+    // With `expandVendors=1` (and a pincode) the response lists one row per
+    // VENDOR OFFER instead of one per product — a search for "cement" then
+    // shows each supplier selling it as its own result.
+    const expandVendors =
+      !!deliveryPin &&
+      ["1", "true", "yes"].includes(
+        String(req.query.expandVendors || "").toLowerCase(),
+      );
 
     const query: any = {
       isDeleted: false,
@@ -293,7 +307,7 @@ export const getMaterials = async (
         isAvailable: true,
         verificationStatus: CUSTOMER_VISIBLE_VERIFICATION,
       })
-        .select("vendor material customerPrice")
+        .select("vendor material customerPrice minOrderQty maxOrderQty")
         .lean();
 
       const servingVendors = await resolveVendorsForPincode(
@@ -302,28 +316,18 @@ export const getMaterials = async (
           (v) => new mongoose.Types.ObjectId(v),
         ),
       );
-      const distanceByVendor = new Map(
-        servingVendors.map((v: any) => [
-          String(v._id),
-          v.distanceMeters != null ? v.distanceMeters / 1000 : null,
-        ]),
-      );
-      const samePinVendors = new Set(
-        servingVendors
-          .filter((v: any) =>
-            String(v.business?.pincode || "").includes(deliveryPin),
-          )
-          .map((v: any) => String(v._id)),
+      const vendorById = new Map(
+        servingVendors.map((v: any) => [String(v._id), v]),
       );
 
-      const summaryByMaterial = new Map<
-        string,
-        { count: number; fromPrice: number | null; bestEtaHours: number | null }
-      >();
+      // One entry per (material, vendor-who-can-deliver-here).
+      const offersByMaterial = new Map<string, any[]>();
 
       stocking.forEach((row: any) => {
         const vendorKey = String(row.vendor);
-        if (!distanceByVendor.has(vendorKey)) return; // vendor can't serve here
+        const vendor = vendorById.get(vendorKey);
+        if (!vendor) return; // this vendor cannot serve the delivery pincode
+
         const materialKey = String(row.material);
         const catalog = materials.find(
           (m: any) => String(m._id) === materialKey,
@@ -335,46 +339,121 @@ export const getMaterials = async (
           null;
         if (price == null) return;
 
-        const eta = deliveryEtaHoursForDistance(
-          distanceByVendor.get(vendorKey) ?? null,
-          samePinVendors.has(vendorKey),
+        const distanceKm =
+          vendor.distanceMeters != null
+            ? +(vendor.distanceMeters / 1000).toFixed(1)
+            : null;
+        const samePincode = String(vendor.business?.pincode || "").includes(
+          deliveryPin,
         );
 
-        const current = summaryByMaterial.get(materialKey) || {
-          count: 0,
-          fromPrice: null,
-          bestEtaHours: null,
-        };
-        current.count += 1;
-        current.fromPrice =
-          current.fromPrice == null
-            ? price
-            : Math.min(current.fromPrice, price);
-        if (eta != null) {
-          current.bestEtaHours =
-            current.bestEtaHours == null
-              ? eta
-              : Math.min(current.bestEtaHours, eta);
-        }
-        summaryByMaterial.set(materialKey, current);
+        const list = offersByMaterial.get(materialKey) || [];
+        list.push({
+          vendorId: vendor._id,
+          vendorCode: vendor.vendorCode || null,
+          vendorName: vendor.business?.name || vendor.name || "Supplier",
+          price,
+          minOrderQty: row.minOrderQty ?? catalog?.minOrderQty ?? 1,
+          maxOrderQty: row.maxOrderQty ?? null,
+          distanceKm,
+          samePincode,
+          deliveryEstimate: deliveryEstimateForDistance(distanceKm, samePincode),
+          deliveryEtaHours: deliveryEtaHoursForDistance(distanceKm, samePincode),
+        });
+        offersByMaterial.set(materialKey, list);
       });
 
-      data = materials.map((m: any) => {
-        const plain = typeof m.toObject === "function" ? m.toObject() : m;
-        const summary = summaryByMaterial.get(String(m._id));
-        return {
-          ...plain,
-          supplierSummary: summary
-            ? {
-                ...summary,
-                bestEtaLabel:
-                  summary.bestEtaHours != null
-                    ? `Delivers within ${summary.bestEtaHours} hours`
-                    : "Delivery time confirmed on order",
-              }
-            : { count: 0, fromPrice: null, bestEtaHours: null, bestEtaLabel: null },
-        };
-      });
+      // Nearest-first within a material, same ordering the comparison screen
+      // uses so the two surfaces never disagree about who is "closest".
+      offersByMaterial.forEach((list) =>
+        list.sort((a, b) => {
+          if (a.samePincode !== b.samePincode) return a.samePincode ? -1 : 1;
+          if (a.distanceKm != null && b.distanceKm != null) {
+            if (a.distanceKm !== b.distanceKm) return a.distanceKm - b.distanceKm;
+          } else if (a.distanceKm != null) return -1;
+          else if (b.distanceKm != null) return 1;
+          return a.price - b.price;
+        }),
+      );
+
+      const plainOf = (m: any) =>
+        typeof m.toObject === "function" ? m.toObject() : m;
+
+      if (expandVendors) {
+        // One row PER VENDOR OFFER rather than per product, so a search for
+        // "cement" lists every supplier selling it. A product nobody stocks
+        // in this area still gets a single catalog-priced row, otherwise it
+        // would silently disappear from search results.
+        data = materials.flatMap((m: any) => {
+          const plain = plainOf(m);
+          const offers = offersByMaterial.get(String(m._id)) || [];
+          if (offers.length === 0) {
+            return [
+              {
+                ...plain,
+                offerKey: `${plain._id}:`,
+                vendor: null,
+                supplierCount: 0,
+              },
+            ];
+          }
+          return offers.map((o) => ({
+            ...plain,
+            // Stable key for list rendering: the same material appears once
+            // per vendor, so `_id` alone is no longer unique in this list.
+            offerKey: `${plain._id}:${o.vendorId}`,
+            // The price THIS vendor charges, which is what checkout bills
+            // when the line is bound to them.
+            finalSellingPrice: o.price,
+            minOrderQty: o.minOrderQty,
+            vendor: {
+              id: o.vendorId,
+              code: o.vendorCode,
+              name: o.vendorName,
+              distanceKm: o.distanceKm,
+              samePincode: o.samePincode,
+              deliveryEstimate: o.deliveryEstimate,
+              deliveryEtaHours: o.deliveryEtaHours,
+            },
+            supplierCount: offers.length,
+          }));
+        });
+      } else {
+        // Summary mode (unchanged): one row per product with a
+        // "from ₹X · N suppliers · ETA" line.
+        data = materials.map((m: any) => {
+          const plain = plainOf(m);
+          const offers = offersByMaterial.get(String(m._id)) || [];
+          if (offers.length === 0) {
+            return {
+              ...plain,
+              supplierSummary: {
+                count: 0,
+                fromPrice: null,
+                bestEtaHours: null,
+                bestEtaLabel: null,
+              },
+            };
+          }
+          const fromPrice = Math.min(...offers.map((o) => o.price));
+          const etas = offers
+            .map((o) => o.deliveryEtaHours)
+            .filter((h): h is number => h != null);
+          const bestEtaHours = etas.length ? Math.min(...etas) : null;
+          return {
+            ...plain,
+            supplierSummary: {
+              count: offers.length,
+              fromPrice,
+              bestEtaHours,
+              bestEtaLabel:
+                bestEtaHours != null
+                  ? `Delivers within ${bestEtaHours} hours`
+                  : "Delivery time confirmed on order",
+            },
+          };
+        });
+      }
     }
 
     res.json({

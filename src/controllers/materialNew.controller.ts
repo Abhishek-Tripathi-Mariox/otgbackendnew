@@ -3,6 +3,8 @@ import mongoose from "mongoose";
 import Material from "../models/Material.model";
 import Category from "../models/Category.model";
 import SubCategory from "../models/SubCategory.model";
+import Vendor from "../models/Vendor.model";
+import VendorMaterial from "../models/VendorMaterial.model";
 import { AuthRequest } from "../types";
 import { AppError } from "../middlewares/errorHandler";
 import { deleteFromS3 } from "../config/s3";
@@ -220,6 +222,10 @@ export const createMaterial = async (
       transportation,
       requestQuote,
       status = "active",
+      // Optional: stock this new material with a vendor straight away.
+      vendorId,
+      vendorPrice,
+      vendorCustomerPrice,
     } = req.body;
 
     const isRequestQuote = requestQuote === "true" || requestQuote === true;
@@ -316,6 +322,55 @@ export const createMaterial = async (
 
     await material.save();
 
+    // Optionally stock the new material with a vendor in the same step, so
+    // admin can add "this product, from this supplier, at these two rates"
+    // without a second trip through Vendors -> Materials.
+    let assignedVendor: { vendorCode?: string; name?: string } | null = null;
+    if (vendorId) {
+      const vendor = await Vendor.findOne({
+        _id: vendorId,
+        isDeleted: false,
+      }).select("name vendorCode status");
+      if (!vendor) {
+        // The material itself is already saved and valid; surface the
+        // problem rather than silently dropping the vendor assignment.
+        throw new AppError(
+          "Material was created, but the selected vendor was not found. Add the vendor's rate from Vendors -> Materials.",
+          404,
+        );
+      }
+
+      const cost = Number(vendorPrice);
+      if (!Number.isFinite(cost) || cost < 0) {
+        throw new AppError(
+          "Material was created, but the vendor rate is invalid. Add it from Vendors -> Materials.",
+          400,
+        );
+      }
+
+      await VendorMaterial.create({
+        vendor: vendor._id,
+        material: material._id,
+        price: cost,
+        customerPrice:
+          vendorCustomerPrice === undefined ||
+          vendorCustomerPrice === null ||
+          vendorCustomerPrice === ""
+            ? null
+            : Number(vendorCustomerPrice),
+        isAvailable: true,
+        // Added by an admin, so it needs no vendor-material approval.
+        verificationStatus: "approved",
+        addedByVendor: false,
+        createdBy: req.admin?._id,
+      });
+
+      assignedVendor = {
+        vendorCode: vendor.vendorCode,
+        name: (vendor as any).business?.name || vendor.name,
+      };
+    }
+
     const populatedMaterial = await Material.findById(material._id)
       .populate("category", "name image status")
       .populate("subCategory", "name image status")
@@ -323,7 +378,9 @@ export const createMaterial = async (
 
     res.status(201).json({
       success: true,
-      message: "Material created successfully",
+      message: assignedVendor
+        ? `Material created and assigned to ${assignedVendor.vendorCode || assignedVendor.name}`
+        : "Material created successfully",
       data: populatedMaterial,
     });
   } catch (error) {
