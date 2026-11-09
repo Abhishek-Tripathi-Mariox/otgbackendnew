@@ -111,6 +111,28 @@ chk "shown prices are exactly this material's customer rates" \
 chk "storefront exposes no cost rate" \
   "$(curl -s "$B/mobile/catalog/vendors/$OTGID"|jq -r '[.data.materials[]|select(has("price"))]|length')" "0"
 
+echo "== vendor identity: customer sees the CODE, never the trading name =="
+chk "comparison rows carry a vendor code" \
+  "$(curl -s "$B/mobile/catalog/materials/$WP/vendors?pincode=$PIN"|jq -r '[.data[]|select(.vendorCode==null)]|length')" "0"
+chk "comparison rows expose no vendorName field" \
+  "$(curl -s "$B/mobile/catalog/materials/$WP/vendors?pincode=$PIN"|jq -r '[.data[]|select(has("vendorName"))]|length')" "0"
+chk "storefront header is a code, not a name" \
+  "$(curl -s "$B/mobile/catalog/vendors/$OTGID"|jq -r '.data.vendor|has("name")')" "false"
+# The real guarantee: no vendor's actual trading name appears anywhere in a
+# customer-facing payload. Knowing it would let a buyer go direct to the
+# supplier and cut OTG out of the deal it sourced.
+VNAMES=$(q 'const o=[]; db.vendors.find({isDeleted:{$ne:true}},{name:1,"business.name":1}).forEach(v=>{if(v.name)o.push(v.name); if(v.business&&v.business.name)o.push(v.business.name)}); print([...new Set(o)].filter(n=>n&&n.length>2).join("\n"))')
+LEAKS=0
+for ep in "mobile/catalog/materials/$WP/vendors?pincode=$PIN" \
+          "mobile/catalog/materials?search=cement&limit=20&pincode=$PIN&expandVendors=1" \
+          "mobile/catalog/vendors/$OTGID"; do
+  BODY=$(curl -s "$B/$ep")
+  while IFS= read -r n; do
+    [ -n "$n" ] && echo "$BODY" | grep -qiF -- "$n" && LEAKS=$((LEAKS+1))
+  done <<< "$VNAMES"
+done
+chk "no vendor trading name in any customer payload" "$LEAKS" "0"
+
 echo "== bulk order lifecycle =="
 UT=$(ulogin 9876590001); UH="Authorization: Bearer $UT"
 [ -n "$UT" ] && ok "customer OTP login" || no "customer OTP login" "no token"

@@ -53,6 +53,17 @@ const deliveryEstimateForDistance = (
   return "Delivery time confirmed on order";
 };
 
+// Customer-facing vendor identity.
+//
+// A vendor's trading NAME is deliberately never sent to the customer app:
+// knowing it lets a buyer contact the supplier directly and cut OTG out of
+// the deal it sourced. The vendor CODE identifies the supplier well enough
+// for the customer to compare options, re-select the same one, and quote it
+// to support, without revealing who they are. Enforced here at the API
+// rather than only in the UI, so the name cannot leak through the wire.
+const customerFacingVendorLabel = (vendor: any): string =>
+  vendor?.vendorCode || "Supplier";
+
 /**
  * Resolve the vendors that can serve a delivery pincode, with their distance
  * where known.
@@ -350,8 +361,7 @@ export const getMaterials = async (
         const list = offersByMaterial.get(materialKey) || [];
         list.push({
           vendorId: vendor._id,
-          vendorCode: vendor.vendorCode || null,
-          vendorName: vendor.business?.name || vendor.name || "Supplier",
+          vendorCode: customerFacingVendorLabel(vendor),
           price,
           minOrderQty: row.minOrderQty ?? catalog?.minOrderQty ?? 1,
           maxOrderQty: row.maxOrderQty ?? null,
@@ -409,7 +419,6 @@ export const getMaterials = async (
             vendor: {
               id: o.vendorId,
               code: o.vendorCode,
-              name: o.vendorName,
               distanceKm: o.distanceKm,
               samePincode: o.samePincode,
               deliveryEstimate: o.deliveryEstimate,
@@ -562,7 +571,7 @@ export const getVendorStorefront = async (
       approvalStatus: "approved",
       isDeleted: false,
     })
-      .select("name business.name business.city business.pincode vendorCode")
+      .select("business.city business.pincode vendorCode")
       .lean();
 
     if (!vendor) throw new AppError("Vendor not found", 404);
@@ -611,7 +620,8 @@ export const getVendorStorefront = async (
       data: {
         vendor: {
           _id: vendor._id,
-          name: (vendor as any).business?.name || vendor.name,
+          // Code, never the trading name — see customerFacingVendorLabel.
+          code: customerFacingVendorLabel(vendor),
           city: (vendor as any).business?.city || null,
           pincode: (vendor as any).business?.pincode || null,
         },
@@ -702,7 +712,7 @@ export const getMaterialVendors = async (
         const samePincode = String(v.business?.pincode || "").includes(pin);
         return {
           vendorId: v._id,
-          vendorName: v.business?.name || v.name || "Vendor",
+          vendorCode: customerFacingVendorLabel(v),
           // Customer-facing price only. `rate.price` (Vendor -> OTG) is
           // deliberately NOT exposed here — it is OTG's cost and margin.
           price: rate?.customerPrice ?? catalogPrice,
