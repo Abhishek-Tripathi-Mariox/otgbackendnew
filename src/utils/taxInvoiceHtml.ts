@@ -98,6 +98,13 @@ export interface TaxInvoiceParams {
   quantity: number;
   rate: number;
   basic: number;
+  /**
+   * Delivery-type convenience fee charged on this order, already part of
+   * `total`. Printed as its own line so the customer can see what they were
+   * charged beyond the goods — previously it was folded into `basic`, which
+   * also inflated the per-unit `rate` shown against the material.
+   */
+  convenienceFee?: number;
   gstRate: number; // total GST rate, e.g. 18 for 18%
   cgst: number;
   sgst: number;
@@ -192,6 +199,13 @@ export const buildTaxInvoiceHtml = (p: TaxInvoiceParams): string => {
         <td class="r">${inr(p.basic)}</td>
       </tr>
       <tr><td colspan="6" class="r b">Basic Amount</td><td class="r">${inr(p.basic)}</td></tr>
+      ${
+        Number(p.convenienceFee) > 0
+          ? `<tr><td colspan="6" class="r">Convenience Fee</td><td class="r">${inr(
+              Number(p.convenienceFee),
+            )}</td></tr>`
+          : ""
+      }
       <tr><td colspan="6" class="r">CGST ( ${halfRate}% )</td><td class="r">${inr(p.cgst)}</td></tr>
       <tr><td colspan="6" class="r">SGST ( ${halfRate}% )</td><td class="r">${inr(p.sgst)}</td></tr>
       <tr><td colspan="6" class="r b">Total</td><td class="r b">${inr(p.total)}</td></tr>

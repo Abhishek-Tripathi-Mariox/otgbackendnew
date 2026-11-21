@@ -65,6 +65,30 @@ const customerFacingVendorLabel = (vendor: any): string =>
   vendor?.vendorCode || "Supplier";
 
 /**
+ * How far a supplier may be from the delivery pincode and still be offered.
+ *
+ * Without a cap, $geoNear sorts by distance but filters nothing, so a buyer
+ * in UP was being shown vendors 500-900 km away in Maharashtra. Overridable
+ * per deployment (VENDOR_SERVICE_RADIUS_KM) because the practical radius for
+ * construction material differs by city.
+ */
+const VENDOR_SERVICE_RADIUS_KM = (() => {
+  const raw = Number(process.env.VENDOR_SERVICE_RADIUS_KM);
+  return Number.isFinite(raw) && raw > 0 ? raw : 50;
+})();
+
+/**
+ * The first three digits of an Indian PIN identify the sorting district, so
+ * they are the closest thing the data has to "the same region": 422xxx is
+ * Nashik, 411xxx/412xxx is Pune. Comparing prefixes is what makes a Nashik
+ * pincode return Nashik suppliers rather than merely the nearest ones.
+ */
+const pincodeRegion = (pin?: string | null): string | null => {
+  const digits = String(pin || "").replace(/\D/g, "");
+  return digits.length === 6 ? digits.slice(0, 3) : null;
+};
+
+/**
  * Resolve the vendors that can serve a delivery pincode, with their distance
  * where known.
  *
@@ -73,6 +97,10 @@ const customerFacingVendorLabel = (vendor: any): string =>
  * the pincode to rank by real distance; when that is unavailable (no API key,
  * network failure, unrecognised pincode) it degrades to matching the vendor's
  * own business pincode, which is the common case anyway.
+ *
+ * Either way the result is limited to the customer's own region: by
+ * VENDOR_SERVICE_RADIUS_KM when coordinates are available, and by the PIN
+ * itself (exact, then same sorting district) when they are not.
  */
 const resolveVendorsForPincode = async (
   pin: string,
@@ -105,12 +133,20 @@ const resolveVendorsForPincode = async (
   };
 
   if (coords) {
+    // Distance is the honest regional test once coordinates are known: it
+    // keeps the suppliers who can actually deliver here and drops the rest,
+    // including one whose business pincode claims Nashik while its address
+    // sits in Mumbai. Deliberately NOT narrowed further by PIN prefix —
+    // Pune alone spans 411xxx and 412xxx, and several vendors never filled
+    // in a business pincode, so prefix matching would hide suppliers a few
+    // kilometres away.
     return Vendor.aggregate([
       {
         $geoNear: {
           near: { type: "Point", coordinates: coords },
           distanceField: "distanceMeters",
           spherical: true,
+          maxDistance: VENDOR_SERVICE_RADIUS_KM * 1000,
           query: baseQuery,
         },
       },
@@ -118,7 +154,21 @@ const resolveVendorsForPincode = async (
     ]);
   }
 
-  return Vendor.find({ ...baseQuery, "business.pincode": new RegExp(pin) })
+  // No coordinates to measure against, so the pincode itself is the only
+  // signal left. Match the exact pincode first; failing that, anyone in the
+  // same PIN region. The old unanchored RegExp(pin) matched a pincode
+  // appearing anywhere inside another value, which is not a region at all.
+  const exact = await Vendor.find({ ...baseQuery, "business.pincode": pin })
+    .select("name vendorCode business")
+    .lean();
+  if (exact.length > 0) return exact;
+
+  const region = pincodeRegion(pin);
+  if (!region) return [];
+  return Vendor.find({
+    ...baseQuery,
+    "business.pincode": new RegExp(`^${region}\\d{3}$`),
+  })
     .select("name vendorCode business")
     .lean();
 };

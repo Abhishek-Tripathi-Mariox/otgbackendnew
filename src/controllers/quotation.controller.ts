@@ -767,6 +767,10 @@ export const assignVendorToQuotation = async (
     const quotation = await Quotation.findById(id);
     if (!quotation) throw new AppError("Quotation not found", 404);
 
+    // Declared out here so the notification block below can tell a genuine
+    // (re)assignment from a no-op re-save and avoid pushing twice for one.
+    let isNewAssignment = false;
+
     if (vendorId) {
       const vendor = await Vendor.findOne({
         _id: vendorId,
@@ -781,7 +785,7 @@ export const assignVendorToQuotation = async (
       // resets the PO's own accept state — the vendor must acknowledge the
       // (possibly new) rate again. A no-op re-save (same vendor, same rate)
       // must NOT reset an already-accepted PO back to "pending".
-      const isNewAssignment =
+      isNewAssignment =
         String(quotation.assignedVendor || "") !== String(vendor._id);
       const previousRate = quotation.vendorRate ?? null;
 
@@ -817,6 +821,40 @@ export const assignVendorToQuotation = async (
     }
 
     await quotation.save();
+
+    // Both sides of the assignment have to hear about it. Until now this
+    // handler saved the assignment and returned: the vendor learned they had
+    // a purchase order only by opening the app and scrolling, and the
+    // customer was never told their bulk order had been placed with a
+    // supplier at all. Best-effort on purpose — a push failure must not fail
+    // the admin's assignment.
+    if (vendorId && isNewAssignment) {
+      notifyVendors([vendorId], {
+        title: "New bulk order assigned",
+        message: `Bulk order ${quotation.quotationCode} has been assigned to you. Review the PO and accept it to proceed.`,
+        quotation: quotation._id as any,
+        createdBy: req.admin!._id,
+      }).catch(() => {});
+
+      if (quotation.user) {
+        User.findById(quotation.user)
+          .select("deviceInfo.fcmToken")
+          .lean()
+          .then((user) => {
+            const token = user?.deviceInfo?.fcmToken;
+            if (!token) return;
+            // The supplier's identity stays out of this deliberately — the
+            // customer app never receives a vendor's trading name.
+            return sendPush(
+              [token],
+              "Bulk order in progress",
+              `Your bulk order ${quotation.quotationCode} has been assigned to a supplier and is being processed.`,
+              { quotationId: String(quotation._id) },
+            );
+          })
+          .catch(() => {});
+      }
+    }
 
     const populated = await Quotation.findById(quotation._id)
       .populate("user", "name mobile email")

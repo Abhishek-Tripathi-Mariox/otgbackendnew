@@ -7,6 +7,7 @@ import { AppError } from "../middlewares/errorHandler";
 import { AuthRequest } from "../types";
 import { ensureInvoicesGenerated } from "../services/invoiceService";
 import { sendPush } from "../services/pushService";
+import { notifyVendors } from "../services/vendorNotify";
 
 // Generate unique booking ID
 const generateBookingId = async (): Promise<string> => {
@@ -230,6 +231,8 @@ export const updateBookingStatus = async (
       throw new AppError("Booking not found.", 404);
     }
 
+    const previousStatus = booking.status;
+
     if (status) {
       if (!BOOKING_STATUSES.includes(status)) {
         throw new AppError(
@@ -261,6 +264,36 @@ export const updateBookingStatus = async (
 
     if (booking.status === "delivered" && booking.paymentStatus === "completed") {
       ensureInvoicesGenerated(String(booking._id)).catch(() => {});
+    }
+
+    // Tell the supplier when an admin decision moves THEIR order. The
+    // Booking post-save hook already notifies the customer, but the vendor
+    // got nothing: after an admin approved QC the vendor had no way to learn
+    // they could start packing short of reopening the app. Only statuses the
+    // vendor must act on are sent, and only on a genuine change.
+    const VENDOR_ACTIONABLE: Record<string, { title: string; message: string }> =
+      {
+        qc_approved: {
+          title: "QC approved",
+          message: "Quality check passed. You can pack this order and mark it ready to dispatch.",
+        },
+        qc_rejected: {
+          title: "QC rejected",
+          message: "Quality check was rejected. Open the order to see the reason and resubmit.",
+        },
+        cancelled: {
+          title: "Order cancelled",
+          message: "This order has been cancelled. No further action is needed.",
+        },
+      };
+    const vendorMessage = VENDOR_ACTIONABLE[booking.status];
+    if (vendorMessage && booking.status !== previousStatus && booking.vendor) {
+      notifyVendors([booking.vendor as any], {
+        title: vendorMessage.title,
+        message: `${booking.bookingId}: ${vendorMessage.message}`,
+        booking: booking._id as any,
+        createdBy: req.admin!._id,
+      }).catch(() => {});
     }
 
     const populatedBooking = await Booking.findById(booking._id)

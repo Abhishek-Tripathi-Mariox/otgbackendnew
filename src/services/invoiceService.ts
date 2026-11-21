@@ -178,7 +178,18 @@ export const renderInvoiceHtml = async (
   const gstAmount = Number(
     invoice.gstAmount != null ? invoice.gstAmount : booking.gstAmount || 0,
   );
-  const basic = Math.max(total - gstAmount, 0);
+  // The convenience fee is a delivery charge sitting inside the customer's
+  // total, not part of the goods. Pulling it out before deriving `basic`
+  // keeps the printed per-unit rate equal to what the customer was actually
+  // quoted for the material, and gives the fee its own line below. The
+  // vendor->OTG invoice is built from the vendor's own rate and never
+  // carries this fee, so it is only taken out of the customer invoice.
+  const convenienceFee =
+    invoice.type === "vendor_to_customer"
+      ? Number(booking.convenienceFee || 0)
+      : 0;
+  const goodsTotal = Math.max(total - convenienceFee, 0);
+  const basic = Math.max(goodsTotal - gstAmount, 0);
   const gstRate = Number(material.gst || 0);
   const rate = qty ? basic / qty : basic;
   const issued = new Date(invoice.generatedAt || booking.createdAt).toLocaleDateString(
@@ -213,6 +224,7 @@ export const renderInvoiceHtml = async (
     quantity: qty,
     rate,
     basic,
+    convenienceFee,
     gstRate,
     cgst: gstAmount / 2,
     sgst: gstAmount / 2,

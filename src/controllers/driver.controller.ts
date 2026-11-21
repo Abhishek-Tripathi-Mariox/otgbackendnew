@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import Driver from "../models/Driver.model";
 import { AuthRequest } from "../types";
 import { AppError } from "../middlewares/errorHandler";
+import { notifyDrivers } from "../services/driverNotify";
 
 // Driver-owned document keys (lives on driver.documents)
 const DRIVER_DOCUMENT_KEYS = ["drivingLicense", "securityPhoto"] as const;
@@ -423,6 +424,20 @@ export const approveDriver = async (
 
     driver.updatedBy = new mongoose.Types.ObjectId(req.admin!._id);
     await driver.save({ validateModifiedOnly: true });
+
+    // Tell the driver they are live. Approval is the moment their app stops
+    // being a waiting room and starts receiving delivery offers, and until
+    // now nothing announced it — they had to keep reopening the app to find
+    // out. notifyDrivers writes the in-app row and pushes in one call.
+    notifyDrivers(
+      [{ _id: driver._id as any, fcmToken: driver.deviceInfo?.fcmToken }],
+      {
+        title: "Account approved",
+        message:
+          "Your delivery partner account has been approved. Go online to start receiving delivery requests.",
+        createdBy: req.admin!._id,
+      },
+    ).catch(() => {});
 
     const updated = await Driver.findById(id)
       .populate("updatedBy", "name email")
