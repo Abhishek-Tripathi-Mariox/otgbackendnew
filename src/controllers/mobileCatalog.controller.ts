@@ -345,7 +345,7 @@ export const getMaterials = async (
     const [materials, total] = await Promise.all([
       Material.find(query)
         .select(
-          "name images brand category subCategory unit minOrderQty mrp sellingPrice finalSellingPrice gst requestQuote transportation",
+          "name images brand category subCategory unit minOrderQty mrp sellingPrice finalSellingPrice gst requestQuote transportation specs",
         )
         .populate("category", "name")
         .populate("subCategory", "name")
@@ -728,7 +728,7 @@ export const getMaterialVendors = async (
       // NOTE: `price` here is the Vendor -> OTG cost rate and must NEVER be
       // returned to a customer. The customer-facing number is
       // `customerPrice`, falling back to the master catalog price below.
-      .select("vendor price customerPrice minOrderQty maxOrderQty")
+      .select("vendor price customerPrice minOrderQty maxOrderQty specs")
       .lean();
 
     if (stocking.length === 0) {
@@ -739,7 +739,7 @@ export const getMaterialVendors = async (
     // Master-catalog selling price, used whenever a vendor has no explicit
     // OTG -> Customer rate of their own (which is every pre-existing row).
     const material = await Material.findById(id)
-      .select("finalSellingPrice sellingPrice")
+      .select("finalSellingPrice sellingPrice specs")
       .lean();
     const catalogPrice =
       (material as any)?.finalSellingPrice ??
@@ -770,6 +770,10 @@ export const getMaterialVendors = async (
           maxOrderQty: rate?.maxOrderQty ?? null,
           distanceKm,
           samePincode,
+          // A vendor may list its own specification for the same material
+          // (a different grade or gauge of the same product); fall back to
+          // the master catalog's when they have not.
+          specs: rate?.specs || (material as any)?.specs || null,
           deliveryEstimate: deliveryEstimateForDistance(distanceKm, samePincode),
           deliveryEtaHours: deliveryEtaHoursForDistance(distanceKm, samePincode),
         };
